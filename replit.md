@@ -1,6 +1,6 @@
-# [Project name]
+# Code Compact
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A local-first browser formatter that turns verbose pasted code into compact, readable output.
 
 ## Run & Operate
 
@@ -22,15 +22,21 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/code-compact/src/App.tsx` — single-page formatter UI, language detection, compact formatting logic, copy, and download actions
+- `artifacts/code-compact/src/index.css` — theme tokens, responsive layout, code editor styling, and motion
+- `artifacts/code-compact/.replit-artifact/artifact.toml` — artifact routing and managed web workflow
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Formatting runs entirely in the browser; pasted source is not uploaded.
+- Short expressions, calls, and object literals are compacted, while control-flow and function blocks keep readable line breaks.
+- The formatter is dependency-light and supports common scripting, markup, styling, and query languages with local heuristics.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- Paste code into an editable source panel and see the compact result live.
+- Choose or detect a language, tune compactness, swap examples, copy output, download output, and toggle dark mode.
+- Show before/after token counts and a savings summary.
 
 ## User preferences
 

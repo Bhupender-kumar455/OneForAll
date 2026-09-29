@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Code Compact"
+description = "A fast browser-based code formatter that detects common languages and produces compact, readable output without unnecessary line breaks."
+version = "1.0.0"
+id = "artifacts/code-compact"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23084
+
+[services.development]
+run = "pnpm --filter @workspace/code-compact run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/code-compact", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/code-compact/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23084"
+BASE_PATH = "/"
