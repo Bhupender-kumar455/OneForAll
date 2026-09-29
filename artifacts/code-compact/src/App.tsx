@@ -286,8 +286,9 @@ function compactStatements(source: string): string {
     if (end > index && balance.paren === 0 && balance.brace === 0 && balance.bracket === 0) {
       const joined = normalizeExpression(lines.slice(index, end + 1).map((line) => line.trim()).join(' '));
       const isObject = current.includes('=') && current.includes('{');
-      const maxLength = isObject ? 240 : 180;
-      if (joined.length <= maxLength) {
+      const isInlineCallback = /(?:=>\s*\{|async\s*\([^)]*\)\s*=>)/.test(joined);
+      const maxLength = isObject ? 300 : 220;
+      if (isInlineCallback || joined.length <= maxLength) {
         compacted.push(joined);
         index = end;
         continue;
