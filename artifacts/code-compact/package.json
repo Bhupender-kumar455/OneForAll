@@ -7,7 +7,8 @@
     "dev": "vite --config vite.config.ts --host 0.0.0.0",
     "build": "vite build --config vite.config.ts",
     "serve": "vite preview --config vite.config.ts --host 0.0.0.0",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"src/**/*.test.ts\""
   },
   "devDependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -73,5 +74,13 @@
     "vite": "catalog:",
     "wouter": "^3.3.5",
     "zod": "catalog:"
+  },
+  "dependencies": {
+    "@wasm-fmt/clang-format": "^23.1.1",
+    "@wasm-fmt/gofmt": "^0.7.3",
+    "@wasm-fmt/ruff_fmt": "^0.15.20",
+    "prettier": "^3.9.6",
+    "sql-formatter": "^15.9.0",
+    "terser": "^5.51.2"
   }
 }

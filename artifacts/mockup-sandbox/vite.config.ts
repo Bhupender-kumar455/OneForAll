@@ -5,27 +5,21 @@ import path from "path";
 import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
 import { mockupPreviewPlugin } from "./mockupPreviewPlugin";
 
-const rawPort = process.env.PORT;
-
-if (!rawPort) {
-  throw new Error(
-    "PORT environment variable is required but was not provided.",
-  );
-}
-
+// Replit injects PORT/BASE_PATH; fall back to safe defaults so the app also
+// runs locally with a plain `pnpm dev` and no environment setup. An unset,
+// empty, or `0` PORT (common in dev/CI shells) means "use the default".
+const configuredPort = process.env.PORT;
+const rawPort =
+  configuredPort === undefined || configuredPort === "" || configuredPort === "0"
+    ? "8081"
+    : configuredPort;
 const port = Number(rawPort);
 
-if (Number.isNaN(port) || port <= 0) {
+if (!Number.isInteger(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-const basePath = process.env.BASE_PATH;
-
-if (!basePath) {
-  throw new Error(
-    "BASE_PATH environment variable is required but was not provided.",
-  );
-}
+const basePath = process.env.BASE_PATH || "/__mockup";
 
 export default defineConfig({
   base: basePath,
