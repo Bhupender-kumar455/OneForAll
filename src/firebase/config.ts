@@ -15,6 +15,7 @@ export interface FirebaseConfig {
   apiKey: string;
   authDomain: string;
   projectId: string;
+  databaseURL: string;
   storageBucket: string;
   messagingSenderId: string;
   appId: string;
@@ -30,10 +31,19 @@ export interface FirebaseConfig {
  */
 export function loadFirebaseConfig(): FirebaseConfig {
   const env = import.meta.env;
+  const projectId = env.VITE_FIREBASE_PROJECT_ID ?? "";
   return {
     apiKey: env.VITE_FIREBASE_API_KEY ?? "",
     authDomain: env.VITE_FIREBASE_AUTH_DOMAIN ?? "",
-    projectId: env.VITE_FIREBASE_PROJECT_ID ?? "",
+    projectId,
+    // `getDatabase()` cannot connect without this, and the SDK does NOT infer
+    // it from the project ID. Copy the exact URL from the Firebase console
+    // (Realtime Database -> the URL shown above the data tree); it carries the
+    // region for databases created outside us-central1. The fallback covers
+    // the common `<project>-default-rtdb.firebaseio.com` shape.
+    databaseURL:
+      env.VITE_FIREBASE_DATABASE_URL ??
+      (projectId ? `https://${projectId}-default-rtdb.firebaseio.com` : ""),
     storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET ?? "",
     messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID ?? "",
     appId: env.VITE_FIREBASE_APP_ID ?? "",
@@ -49,7 +59,7 @@ export function getFirebaseApp(): FirebaseApp {
 
   // Keep the whole module importable/usable when there is no Firebase project
   // configured (local-only dev, `pnpm build` without env vars, etc.).
-  if (!config.apiKey || !config.projectId) {
+  if (!config.apiKey || !config.projectId || !config.databaseURL) {
     console.warn(
       "[transfer] Firebase is not configured (missing VITE_FIREBASE_* env vars). " +
         "Transfers are disabled.",
@@ -69,5 +79,8 @@ export function getFirebaseApp(): FirebaseApp {
 }
 
 export function isFirebaseConfigured(): boolean {
-  return loadFirebaseConfig().projectId !== "";
+  const config = loadFirebaseConfig();
+  // The database URL is required: the Realtime Database is the signaling
+  // channel, and without it every read/write fails at connect time.
+  return Boolean(config.apiKey && config.projectId && config.databaseURL);
 }

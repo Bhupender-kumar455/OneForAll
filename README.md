@@ -153,21 +153,91 @@ and no bytes take a base64 or JSON detour. Sending pauses when the channel's
 buffered amount exceeds 256 KiB (backpressure), progress is reported as bytes
 transferred, and either side can cancel mid-flight.
 
-Transfers need a Firebase project. Create one, enable **Anonymous** sign-in and
-the **Realtime Database**, then set:
+### Setting up Firebase
 
-```bash
-VITE_FIREBASE_API_KEY=…
-VITE_FIREBASE_AUTH_DOMAIN=…
-VITE_FIREBASE_PROJECT_ID=…
-VITE_FIREBASE_STORAGE_BUCKET=…
-VITE_FIREBASE_MESSAGING_SENDER_ID=…
-VITE_FIREBASE_APP_ID=…
+Transfers are disabled until a Firebase project is wired up. Everything else
+in the app works without one. Takes about five minutes:
+
+**1. Create the project.** Go to the [Firebase console](https://console.firebase.google.com/),
+click **Add project**, give it a name, and finish the wizard (Analytics is
+optional).
+
+**2. Add a web app.** On the project home page click the **Web** icon (`</>`).
+Register the app with a nickname — do *not* tick Firebase Hosting, this app
+hosts itself. Firebase then shows a `firebaseConfig` block; keep this tab open,
+you need its values in step 6.
+
+**3. Turn on Anonymous sign-in.** **Build → Authentication → Get started →
+Sign-in method → Anonymous → Enable → Save.** Transfers rely on each browser
+getting a throwaway UID; no one has to make an account.
+
+**4. Create the Realtime Database.** **Build → Realtime Database → Create
+Database.** Pick a location near you, and start in **locked mode** — the rules
+in step 5 open just what is needed. Copy the URL shown above the data tree
+(it looks like `https://<project-id>-default-rtdb.firebaseio.com`, and may
+carry a region such as `europe-west1`).
+
+**5. Paste in the security rules.** Open the **Rules** tab and replace the
+contents with this, then **Publish**:
+
+```json
+{
+  "rules": {
+    "transfers": {
+      ".read": "auth != null",
+      ".write": "auth != null",
+      "$transferId": {
+        ".validate": "newData.hasChildren(['ownerUid', 'file', 'status', 'createdAt', 'expiresAt'])"
+      }
+    }
+  }
+}
 ```
 
-With no variables set the app still builds and runs: the Transfer tab reports
-that transfers are disabled instead of failing mid-handshake. Optional
-`VITE_WEBRTC_STUN`, `VITE_WEBRTC_TURN_URL`, `VITE_WEBRTC_TURN_USERNAME` and
-`VITE_WEBRTC_TURN_CREDENTIAL` override the default Google STUN server and add a
-TURN relay for networks that block direct connections. Transfers (both tabs)
-must be served over HTTPS or `localhost` for WebRTC to be available.
+This requires a signed-in (anonymous counts) browser and rejects records that
+are missing the fields the app writes. It is deliberately permissive about
+*which* transfer a signed-in user can touch — the transfer ID is an
+unguessable UUID, but anyone holding a link can read it. That is the MVP
+trade-off for having no accounts.
+
+**6. Put the values in `.env`.** Copy the template and fill it in:
+
+```bash
+cp .env.example .env
+```
+
+```bash
+VITE_FIREBASE_API_KEY=…                 # from firebaseConfig
+VITE_FIREBASE_AUTH_DOMAIN=…             # from firebaseConfig
+VITE_FIREBASE_PROJECT_ID=…              # from firebaseConfig
+VITE_FIREBASE_DATABASE_URL=…            # the URL you copied in step 4
+VITE_FIREBASE_STORAGE_BUCKET=…          # from firebaseConfig
+VITE_FIREBASE_MESSAGING_SENDER_ID=…     # from firebaseConfig
+VITE_FIREBASE_APP_ID=…                  # from firebaseConfig
+```
+
+`.env` is gitignored; `.env.example` documents the keys. Only `VITE_`-prefixed
+names reach the browser — that is expected, these values are public. Your
+**security rules** are what protect the data, never the API key.
+
+`VITE_FIREBASE_PROJECT_ID` and `VITE_FIREBASE_DATABASE_URL` are the two the app
+really cannot run without. The database URL is **not** inferred from the
+project ID by the SDK, so an empty or wrong value means every read and write
+fails to connect; if you leave it blank the app falls back to
+`https://<project-id>-default-rtdb.firebaseio.com`, which is wrong for
+non-default regions.
+
+**7. Restart the dev server.** Vite inlines `VITE_*` variables at startup, so
+`.env` changes need a fresh `pnpm dev` (and a fresh `pnpm build` for deploys).
+
+**8. Test it.** Open `/transfer`, send `?t=` link to yourself, e.g. from
+`localhost:23084` to `127.0.0.1:23084` — WebRTC needs HTTPS or `localhost`,
+and two tabs of the same build work fine. Pick a file, copy the share link,
+open it in the second tab, and the download starts on its own. If transfers
+report as disabled, check the browser console: an unconfigured or invalid
+project logs the reason there.
+
+Optional `VITE_WEBRTC_STUN`, `VITE_WEBRTC_TURN_URL`,
+`VITE_WEBRTC_TURN_USERNAME` and `VITE_WEBRTC_TURN_CREDENTIAL` override the
+default Google STUN server and add a TURN relay. A TURN relay is only needed
+when both peers sit behind symmetric NATs and cannot connect directly.

@@ -51,6 +51,8 @@ Thumbs.db
 
 .vercel
 .env*
+# ...but keep the checked-in template that documents the required keys.
+!.env.example
 
 # agent/editor tooling metadata
 .freebuff/
