@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Code Formatter"
+description = "A fast, local-first code formatter and beautifier, plus a screenshot text extractor. Paste code or drop an image; nothing is uploaded."
+version = "1.0.0"
+id = "."
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23084
+
+[services.development]
+run = "pnpm dev"
+
+[services.production]
+build = [ "pnpm", "build" ]
+serve = "static"
+publicDir = "dist"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23084"
+BASE_PATH = "/"
