@@ -17,6 +17,7 @@
     "@wasm-fmt/clang-format": "^23.1.1",
     "@wasm-fmt/gofmt": "^0.7.3",
     "@wasm-fmt/ruff_fmt": "^0.15.20",
+    "firebase": "^12.19.0",
     "prettier": "^3.9.6",
     "sql-formatter": "^15.9.0",
     "terser": "^5.51.2",

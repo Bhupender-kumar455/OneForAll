@@ -1,11 +1,13 @@
 # Code Compact
 
-A local-first toolbox with two tools that share one shell:
+A local-first toolbox with three tools that share one shell:
 
 - **Code Formatter & Beautifier** — paste code, pick a language, get clean,
   consistently formatted output, with an optional Minify mode.
 - **Text Extractor** — drop a screenshot or paste an image to read the text
   inside it, using OCR (Tesseract) compiled to WebAssembly.
+- **Transfer** — send a file directly to another browser over WebRTC. The
+  bytes never touch a server; Firebase only coordinates the connection.
 
 Everything runs in the browser. No source and no image is ever uploaded, and
 the OCR engine's own assets are self-hosted so recognition works fully offline.
@@ -60,7 +62,19 @@ src/
   pages/
     formatter.tsx          the formatter + beautifier page
     text-extractor.tsx     the screenshot OCR page
+    transfer.tsx           the P2P file transfer page
     not-found.tsx          404
+  firebase/
+    config.ts              app init + isConfigured() (env-driven, optional)
+    auth.ts                anonymous sign-in
+    database.ts            signaling records + candidate/offer/answer writes
+  webrtc/
+    types.ts               shared transfer types
+    protocol.ts            chunk framing + reassembly (unit-tested)
+    peer.ts                RTCPeerConnection wrapper
+    sender.ts              file -> DataChannel with backpressure
+    receiver.ts            DataChannel -> reassembled Blob
+    signaling.ts           sender/receiver orchestration over Firebase
   lib/
     bytes.ts               line/character/byte metrics
     styles.ts              shared button class string
@@ -115,8 +129,9 @@ passed to the engine untouched to keep memory bounded.
 ## Tests
 
 `pnpm test` runs everything under `src/**/*.test.ts` with Node's built-in test
-runner: formatter regressions per language, the line diff, and the OCR image
-preparation.
+runner: formatter regressions per language, the line diff, the OCR image
+preparation, and the transfer protocol — chunk framing, reassembly, and an
+end-to-end sender → receiver transfer over a loopback channel.
 
 ## Deployment
 
@@ -124,11 +139,35 @@ preparation.
 to `index.html` so client-side routes work. The same settings are mirrored in
 `.replit-artifact/artifact.toml` for a Replit deploy.
 
-## Transfer (in progress)
+## Transfer
 
-A third tab in the navbar opens the transfer landing page. The full
-peer-to-peer spec is in `P2P_File_Transfer_Project_Plan.docx`: Firebase
-signaling for offer/answer/ICE, WebRTC DataChannel carrying the file bytes,
-chunked transfer with backpressure, progress/speed/cancel, and SHA-256
-integrity. Right now it shows the plan summary; the sender/receiver flows are
-expected work.
+The **Transfer** tab sends a file browser-to-browser. The sender picks a file
+and gets a `…/transfer?t=<id>` link; the receiver opens it and the file streams
+over a WebRTC DataChannel. Firebase Realtime Database carries only the
+signaling (offer, answer, ICE candidates) and a small session record; the file
+bytes never leave the two peers.
+
+A file is sliced into 64 KiB chunks. Each chunk is sent as a binary frame with
+an 8-byte offset header, so out-of-order delivery still reassembles correctly
+and no bytes take a base64 or JSON detour. Sending pauses when the channel's
+buffered amount exceeds 256 KiB (backpressure), progress is reported as bytes
+transferred, and either side can cancel mid-flight.
+
+Transfers need a Firebase project. Create one, enable **Anonymous** sign-in and
+the **Realtime Database**, then set:
+
+```bash
+VITE_FIREBASE_API_KEY=…
+VITE_FIREBASE_AUTH_DOMAIN=…
+VITE_FIREBASE_PROJECT_ID=…
+VITE_FIREBASE_STORAGE_BUCKET=…
+VITE_FIREBASE_MESSAGING_SENDER_ID=…
+VITE_FIREBASE_APP_ID=…
+```
+
+With no variables set the app still builds and runs: the Transfer tab reports
+that transfers are disabled instead of failing mid-handshake. Optional
+`VITE_WEBRTC_STUN`, `VITE_WEBRTC_TURN_URL`, `VITE_WEBRTC_TURN_USERNAME` and
+`VITE_WEBRTC_TURN_CREDENTIAL` override the default Google STUN server and add a
+TURN relay for networks that block direct connections. Transfers (both tabs)
+must be served over HTTPS or `localhost` for WebRTC to be available.
