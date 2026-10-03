@@ -5,6 +5,7 @@ import { ErrorBoundary } from "@/components/error-boundary";
 import FormatterPage from "@/pages/formatter";
 import NotFound from "@/pages/not-found";
 import TextExtractor from "@/pages/text-extractor";
+import TransferPage from "@/pages/transfer";
 
 /** The whole app shares one error boundary that resets when the route changes. */
 function RoutedErrorBoundary({ children }: { children: ReactNode }) {
@@ -18,6 +19,7 @@ function Router() {
       <Switch>
         <Route path="/" component={FormatterPage} />
         <Route path="/extract" component={TextExtractor} />
+        <Route path="/transfer" component={TransferPage} />
         <Route component={NotFound} />
       </Switch>
     </RoutedErrorBoundary>

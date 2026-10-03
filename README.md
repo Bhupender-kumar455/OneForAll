@@ -123,3 +123,12 @@ preparation.
 `vercel.json` builds with `pnpm build` and serves `dist/`, rewriting every path
 to `index.html` so client-side routes work. The same settings are mirrored in
 `.replit-artifact/artifact.toml` for a Replit deploy.
+
+## Transfer (in progress)
+
+A third tab in the navbar opens the transfer landing page. The full
+peer-to-peer spec is in `P2P_File_Transfer_Project_Plan.docx`: Firebase
+signaling for offer/answer/ICE, WebRTC DataChannel carrying the file bytes,
+chunked transfer with backpressure, progress/speed/cancel, and SHA-256
+integrity. Right now it shows the plan summary; the sender/receiver flows are
+expected work.
