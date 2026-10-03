@@ -14,6 +14,7 @@ function RoutedErrorBoundary({ children }: { children: ReactNode }) {
 }
 
 function Router() {
+  const [location] = useLocation();
   return (
     <RoutedErrorBoundary>
       <Switch>

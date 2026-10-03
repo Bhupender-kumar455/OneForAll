@@ -16,9 +16,10 @@ const BRAND_DECORATED = "▂▃▅▇█▓▒░ OneForAll ░▒▓█▇▅�
 /**
  * Top bar shared by every page. It owns the theme preference (persisted under
  * the same `cc-theme` key the formatter has always used) and the tab navigation
- * between the code formatter and the text extractor.
+ *    between the code formatter, the text extractor and the file
+    transfer view.
  */
-export function SiteHeader({ active }: { active: "code" | "extract" }) {
+export function SiteHeader({ active }: { active: "code" | "extract" | "transfer" }) {
   const [dark, setDark] = useState(() => {
     if (typeof window === "undefined") return false;
     const stored = window.localStorage.getItem("cc-theme");
@@ -58,6 +59,9 @@ export function SiteHeader({ active }: { active: "code" | "extract" }) {
             </Link>
             <Link href="/extract" className={tabClass(active === "extract")}>
               Text Extractor
+            </Link>
+            <Link href="/transfer" className={tabClass(active === "transfer")}>
+              Transfer
             </Link>
             {active === "code" && (
               <span className="hidden items-center gap-1 md:flex">
