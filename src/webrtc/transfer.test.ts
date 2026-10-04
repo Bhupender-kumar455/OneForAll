@@ -4,7 +4,25 @@ import { describe, it } from "node:test";
 import { DataReceiver } from "./receiver.ts";
 import { DataSender } from "./sender.ts";
 import { CHUNK_SIZE } from "./protocol.ts";
+import { createSink, type TransferSink } from "./sink.ts";
 import type { TransferChannel } from "./types.ts";
+
+/** Wrap the real sink so every write resolves on a later macrotask. */
+function slowSink(delayMs: number) {
+  return async (name: string, totalSize: number): Promise<TransferSink> => {
+    const inner = await createSink(name, totalSize);
+    return {
+      kind: inner.kind,
+      write: async (offset, data) => {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await inner.write(offset, data);
+      },
+      finish: () => inner.finish(),
+      digest: () => inner.digest(),
+      dispose: () => inner.dispose(),
+    };
+  };
+}
 
 /**
  * Two stub channels wired to each other, standing in for a WebRTC DataChannel
@@ -122,6 +140,46 @@ describe("DataSender -> DataReceiver", () => {
     });
     assert.equal(progress.at(-1), source.length);
     assert.ok(progress.every((value, i) => i === 0 || value >= progress[i - 1]));
+  });
+
+  it("completes when the sink is slower than the channel", async () => {
+    // The last chunk's write is still queued when `file-complete` arrives; a
+    // synchronous completeness check would wrongly report a missing chunk.
+    const [out, back] = makeChannelPair();
+    const size = CHUNK_SIZE * 3;
+    const source = new Uint8Array(size);
+    for (let i = 0; i < size; i += 1) source[i] = (i * 3) % 256;
+    const file = makeFile("slow-sink.bin", source);
+
+    const errors: string[] = [];
+    let blob: Blob | null = null;
+    const receiver = new DataReceiver("slow", back, {
+      onError: (e) => errors.push(e),
+      onComplete: (b) => { blob = b; },
+      sinkFactory: slowSink(1),
+    });
+
+    await new DataSender("slow", out, file, {}).sendFile();
+    const finished = await waitFor(() => blob);
+    assert.deepEqual(errors, []);
+    assert.equal(receiver.bytesReceived, size);
+    assert.deepEqual(Array.from(new Uint8Array(await finished.arrayBuffer())), Array.from(source));
+  });
+
+  it("refuses a file whose declared size exceeds the cap", async () => {
+    const [out, back] = makeChannelPair();
+    const errors: string[] = [];
+    new DataReceiver("cap", back, { onError: (e) => errors.push(e) });
+    // A 2 GB declaration must be rejected before any buffer is allocated.
+    out.send(JSON.stringify({
+      type: "file-start",
+      name: "huge.bin",
+      size: 2 * 1024 * 1024 * 1024,
+      mime: "application/octet-stream",
+      chunkSize: CHUNK_SIZE,
+    }));
+    await waitFor(() => (errors.length ? errors : null));
+    assert.match(errors[0], /invalid file size/i);
   });
 
   it("lets the sender cancel mid-transfer", async () => {

@@ -34,7 +34,7 @@ import {
   writeTransferStatus,
   type TransferDto,
 } from "../firebase/database";
-import { sha256Blob, sha256File } from "./checksum";
+import { sha256File } from "./checksum";
 import { mirrorRemoteCandidates, toStoredCandidate } from "./ice";
 import { Peer } from "./peer";
 import { DataReceiver } from "./receiver";
@@ -212,7 +212,6 @@ export async function joinTransfer(
   );
 
   const channel = await peer.waitForDataChannel(CONNECTION_TIMEOUT_MS);
-  const expected = dto.file.checksum;
 
   const dataReceiver = new DataReceiver(transferId, channel, {
     onStatus: (status) => handlers.onStatus?.(status as TransferStatus),
@@ -220,26 +219,16 @@ export async function joinTransfer(
     onCancelled: handlers.onCancelled,
     onError: handlers.onError,
     onFileStart: handlers.onFileStart,
+    // The receiver verifies against the sender's digest and only calls
+    // `onComplete` when it matches, so a corrupt file is never saved.
+    expectedChecksum: dto.file.checksum,
+    onVerified: handlers.onVerified,
     onComplete: (blob, name) => {
-      // Verify before handing the file over: a corrupted transfer must not be
-      // saved as if it were good.
-      void (async () => {
-        const actual = await sha256Blob(blob);
-        const ok = expected ? actual === expected : true;
-        handlers.onVerified?.(ok, actual, expected);
-
-        if (!ok) {
-          handlers.onError?.(
-            "The received file failed its integrity check and was not saved.",
-          );
-          handlers.onStatus?.("failed");
-          return;
-        }
-
-        downloadBlob(blob, name);
-        void writeTransferStatus(transferId, "completed").catch(() => {});
-        handlers.onComplete?.();
-      })();
+      downloadBlob(blob, name);
+      void writeTransferStatus(transferId, "completed").catch(() => {});
+      handlers.onComplete?.();
+      // The bytes are on disk/downloaded now; free the scratch entry.
+      void dataReceiver.dispose();
     },
   });
 

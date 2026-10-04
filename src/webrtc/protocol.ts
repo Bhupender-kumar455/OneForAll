@@ -2,9 +2,9 @@
  * Application-level protocol for the WebRTC DataChannel.
  *
  * Firebase carries the signaling; the bytes travel here.  A file is sliced
- * into `CHUNK_SIZE` byte pieces, each sent as a `chunk` message carrying its
- * byte offset.  The receiver buffers chunks by offset and reassembles once
- * every piece has arrived, so out-of-order delivery does not matter.
+ * into `CHUNK_SIZE` byte pieces, each sent as a binary frame carrying its byte
+ * offset, so the receiver can write it straight to its final position and
+ * out-of-order delivery does not matter.
  */
 import type { ControlMessage } from "./types";
 
@@ -57,27 +57,3 @@ export function decodeChunk(frame: ArrayBuffer): {
   return { offset, data: new Uint8Array(frame, CHUNK_HEADER_BYTES) };
 }
 
-/**
- * Reassemble a set of offset-addressed chunks into the complete file.
- *
- * Returns `null` while chunks are still missing.  `totalSize` is the file size
- * announced in `file-start`, so any gap means the transfer is not done yet.
- */
-export function assembleChunks(
-  chunks: ReadonlyMap<number, Uint8Array>,
-  totalSize: number,
-): Uint8Array<ArrayBuffer> | null {
-  if (totalSize <= 0) return null;
-  for (let offset = 0; offset < totalSize; offset += CHUNK_SIZE) {
-    if (!chunks.has(offset)) return null;
-  }
-
-  const bytes = new Uint8Array(totalSize);
-  for (const [offset, chunk] of chunks) {
-    if (offset + chunk.byteLength > totalSize) {
-      throw new Error("Chunk overflows the declared file size");
-    }
-    bytes.set(chunk, offset);
-  }
-  return bytes;
-}

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
-  assembleChunks,
   CHUNK_HEADER_BYTES,
   CHUNK_SIZE,
   decodeChunk,
@@ -38,45 +37,23 @@ describe("chunk framing", () => {
   });
 });
 
-describe("assembleChunks", () => {
-  const fileOf = (size: number): Uint8Array => {
+describe("chunk framing across a whole file", () => {
+  it("frames every chunk of a multi-chunk file and returns the bytes intact", () => {
+    const size = CHUNK_SIZE * 3 + 100;
     const bytes = new Uint8Array(size);
     for (let i = 0; i < size; i += 1) bytes[i] = (i * 7) % 256;
-    return bytes;
-  };
 
-  const chunkify = (bytes: Uint8Array): Map<number, Uint8Array> => {
-    const chunks = new Map<number, Uint8Array>();
-    for (let offset = 0; offset < bytes.length; offset += CHUNK_SIZE) {
-      chunks.set(offset, bytes.subarray(offset, offset + CHUNK_SIZE));
+    const offsets: number[] = [];
+    for (let offset = 0; offset < size; offset += CHUNK_SIZE) {
+      const payload = bytes.slice(offset, offset + CHUNK_SIZE);
+      const decoded = decodeChunk(encodeChunk(offset, payload.buffer as ArrayBuffer));
+      assert.equal(decoded.offset, offset);
+      assert.deepEqual(Array.from(decoded.data), Array.from(payload));
+      offsets.push(decoded.offset);
     }
-    return chunks;
-  };
 
-  it("reassembles a file spread over several chunks", () => {
-    const bytes = fileOf(CHUNK_SIZE * 3 + 100);
-    const result = assembleChunks(chunkify(bytes), bytes.length);
-    assert.ok(result);
-    assert.deepEqual(Array.from(result), Array.from(bytes));
-  });
-
-  it("returns null while a chunk is still missing", () => {
-    const bytes = fileOf(CHUNK_SIZE * 2);
-    const chunks = chunkify(bytes);
-    chunks.delete(0);
-    assert.equal(assembleChunks(chunks, bytes.length), null);
-  });
-
-  it("throws when a chunk overruns the declared size", () => {
-    const chunks = new Map<number, Uint8Array>([
-      [0, new Uint8Array(10)],
-      [10, new Uint8Array(10)],
-    ]);
-    assert.throws(() => assembleChunks(chunks, 15));
-  });
-
-  it("returns null for a zero-byte file", () => {
-    assert.equal(assembleChunks(new Map(), 0), null);
+    assert.equal(offsets.length, Math.ceil(size / CHUNK_SIZE));
+    assert.equal(offsets.at(-1), CHUNK_SIZE * 3);
   });
 });
 
