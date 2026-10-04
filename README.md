@@ -147,6 +147,14 @@ over a WebRTC DataChannel. Firebase Realtime Database carries only the
 signaling (offer, answer, ICE candidates) and a small session record; the file
 bytes never leave the two peers.
 
+On the receiving side the file is written straight to its final offset in a
+sink — the Origin Private File System when the browser provides it, otherwise a
+single preallocated buffer — and verified a window at a time against the
+sender's SHA-256. Memory therefore stays flat instead of scaling with the file:
+a 300 MB transfer grows the heap by about 9 MB in Chrome. Browsers without OPFS
+fall back to holding one copy of the file, which is where the practical size
+limit comes from there.
+
 A file is sliced into 64 KiB chunks. Each chunk is sent as a binary frame with
 an 8-byte offset header, so out-of-order delivery still reassembles correctly
 and no bytes take a base64 or JSON detour. Sending pauses when the channel's
@@ -195,10 +203,26 @@ contents with this, then **Publish**:
 ```
 
 This requires a signed-in (anonymous counts) browser and rejects records that
-are missing the fields the app writes. It is deliberately permissive about
-*which* transfer a signed-in user can touch — the transfer ID is an
-unguessable UUID, but anyone holding a link can read it. That is the MVP
-trade-off for having no accounts.
+are missing the fields the app writes.
+
+**Security model — read this before sending anything sensitive.** The rules are
+deliberately permissive about *which* transfer a signed-in user can touch. The
+transfer ID is an unguessable UUID, so a transfer is hard to find, but **anyone
+holding the link can read the record and complete the transfer as the
+receiver**. There is no identity check, no password, and no way to tell you
+whether the person receiving is the person you meant. Treat a share link like
+an unlisted URL: fine for a file between your own devices, not for anything you
+would not put on one. Tighter scoping is possible (put the receiver's UID, or a
+signed one-time token, in the link), but it makes a link single-recipient and
+non-forwardable, which is why the short form is the default here.
+
+The file bytes are always encrypted in transit by WebRTC's DTLS, and they never
+reach the database — only the SDP and ICE candidates do, which reveal the peers'
+ip addresses to anyone who can read the record.
+
+Records are deleted when a transfer is cancelled, and the Transfer tab sweeps
+any record past its 30-minute deadline once an hour, so a tab closed mid-session
+does not leave debris behind.
 
 **6. Put the values in `.env`.** Copy the template and fill it in:
 

@@ -2,8 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { SiteHeader } from "@/components/site-header";
 import { BUTTON_BASE } from "@/lib/styles";
 import { cn } from "@/lib/utils";
+import { sweepExpiredTransfers } from "@/firebase/database";
 import { startTransfer, joinTransfer, type Handle } from "@/webrtc/signaling";
 import type { TransferStatus } from "@/webrtc/types";
+
+/** How often one browser session bothers sweeping dead transfers. */
+const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+const SWEEP_STAMP_KEY = "cc-transfer-swept-at";
 
 /**
  * File Transfer page — the UI over `src/webrtc/`.
@@ -77,6 +82,19 @@ export default function TransferPage() {
   const handleRef = useRef<Handle | null>(null);
   // Stop an in-flight session if the page unmounts.
   useEffect(() => () => handleRef.current?.cancel("Page closed"), []);
+
+  // Clear out records abandoned by a closed tab or a crash. Throttled per
+  // session so visiting the tab does not re-read the whole node every time.
+  useEffect(() => {
+    try {
+      const last = Number(window.sessionStorage.getItem(SWEEP_STAMP_KEY) ?? 0);
+      if (Date.now() - last < SWEEP_INTERVAL_MS) return;
+      window.sessionStorage.setItem(SWEEP_STAMP_KEY, String(Date.now()));
+    } catch {
+      // Storage unavailable; fall through and sweep anyway.
+    }
+    void sweepExpiredTransfers().catch(() => {});
+  }, []);
 
   const sessionUpdate = useCallback((patch: Partial<Extract<Phase, { kind: "session" }>>) => {
     setPhase((prev) =>

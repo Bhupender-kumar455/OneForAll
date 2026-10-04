@@ -24,7 +24,9 @@
 
 import { ref, get, set, update, onValue, remove } from "firebase/database";
 import { getDatabase } from "firebase/database";
+import { waitForAuthUser } from "./auth";
 import { getFirebaseApp, isFirebaseConfigured } from "./config";
+import { selectExpired } from "../webrtc/expiry";
 import type {
   StoredCandidate,
   TransferFile,
@@ -80,6 +82,32 @@ export function createTransferDto(
 
 export function isTransferExpired(dto: TransferDto): boolean {
   return Date.now() > dto.expiresAt;
+}
+
+/**
+ * Delete signaling records whose session has expired.
+ *
+ * Records are otherwise only removed by an explicit cancel, so an abruptly
+ * closed tab leaves one behind forever.  Sweeping on app start keeps the
+ * database from filling with dead sessions.  Best-effort: any failure here is
+ * irrelevant to whatever the user is actually doing.
+ */
+export async function sweepExpiredTransfers(now = Date.now()): Promise<number> {
+  if (!isConfigured()) return 0;
+
+  // The rules require a signed-in user, and this runs on page load — before
+  // anything else has triggered the anonymous sign-in. Without this the read
+  // is rejected and the sweep silently does nothing.
+  await waitForAuthUser();
+
+  const snapshot = await get(ref(db, "transfers"));
+  const all = snapshot.val() as Record<string, TransferDto | null> | null;
+  const stale = selectExpired(all, now);
+
+  await Promise.all(
+    stale.map((id) => remove(ref(db, `transfers/${id}`)).catch(() => {})),
+  );
+  return stale.length;
 }
 
 export function validateTransferFile(file: TransferFile): string | null {
