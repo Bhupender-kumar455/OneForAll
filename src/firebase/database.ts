@@ -25,7 +25,12 @@
 import { ref, get, set, update, onValue, remove } from "firebase/database";
 import { getDatabase } from "firebase/database";
 import { getFirebaseApp, isFirebaseConfigured } from "./config";
-import type { TransferFile, TransferStatus, TransferId } from "../webrtc/types";
+import type {
+  StoredCandidate,
+  TransferFile,
+  TransferId,
+  TransferStatus,
+} from "../webrtc/types";
 
 // `getFirebaseApp()` always returns a usable app (it falls back to a
 // placeholder when unconfigured), so this handle can be created eagerly.
@@ -42,8 +47,8 @@ export interface TransferDto {
   expiresAt: number;
   offer: string | null;
   answer: string | null;
-  senderCandidates: Record<string, string>;
-  receiverCandidates: Record<string, string>;
+  senderCandidates: Record<string, StoredCandidate>;
+  receiverCandidates: Record<string, StoredCandidate>;
   bytesReceived: number;
 }
 
@@ -150,25 +155,32 @@ export function writeTransferAnswer(
   return set(ref(db, `transfers/${transferId}/answer`), answer);
 }
 
+/**
+ * Publish one of our ICE candidates.
+ *
+ * The whole candidate is stored, not just its `candidate` string: a peer needs
+ * `sdpMid` or `sdpMLineIndex` to apply it, and Firebase drops `null` fields,
+ * so absent values simply come back undefined on the other side.
+ */
 export function addSenderCandidate(
   transferId: string,
-  candidateId: string,
-  candidate: string,
+  candidate: StoredCandidate,
 ): Promise<void> {
   if (!isConfigured()) return Promise.reject(new Error("Firebase not configured"));
+  const id = crypto.randomUUID();
   return update(ref(db, `transfers/${transferId}/senderCandidates`), {
-    [candidateId]: candidate,
+    [id]: candidate,
   });
 }
 
 export function addReceiverCandidate(
   transferId: string,
-  candidateId: string,
-  candidate: string,
+  candidate: StoredCandidate,
 ): Promise<void> {
   if (!isConfigured()) return Promise.reject(new Error("Firebase not configured"));
+  const id = crypto.randomUUID();
   return update(ref(db, `transfers/${transferId}/receiverCandidates`), {
-    [candidateId]: candidate,
+    [id]: candidate,
   });
 }
 

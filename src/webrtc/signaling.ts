@@ -30,6 +30,7 @@ import {
   writeTransferStatus,
   type TransferDto,
 } from "../firebase/database";
+import { mirrorRemoteCandidates, toStoredCandidate } from "./ice";
 import { Peer } from "./peer";
 import { DataReceiver } from "./receiver";
 import { DataSender, type SenderOptions } from "./sender";
@@ -79,7 +80,7 @@ export async function startTransfer(
   const peer = new Peer(
     transferId,
     (candidate) =>
-      void addSenderCandidate(transferId, candidate.sdpMid ?? "", candidate.candidate),
+      void addSenderCandidate(transferId, toStoredCandidate(candidate)).catch(() => {}),
     (state) => handlers.onStatus?.(state as TransferStatus),
     (state) => {
       if (state === "connected") handlers.onStatus?.("connected");
@@ -97,19 +98,11 @@ export async function startTransfer(
   await peer.acceptAnswer({ type: "answer", sdp: answerSdp });
 
   // Mirror the receiver's ICE candidates into the connection.
-  const unsubscribe = onValue(
-    ref(db, `transfers/${transferId}/receiverCandidates`),
-    (snap) => {
-      const candidates = snap.val() as Record<string, string> | null;
-      if (!candidates) return;
-      for (const candidate of Object.values(candidates)) {
-        void peer.addIceCandidate({ candidate }).catch((err: unknown) => {
-          handlers.onError?.(
-            `ICE candidate failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-    },
+  const unsubscribe = mirrorRemoteCandidates(
+    transferId,
+    "receiverCandidates",
+    peer,
+    handlers.onError,
   );
 
   const senderOptions: SenderOptions = {
@@ -173,7 +166,7 @@ export async function joinTransfer(
   const peer = new Peer(
     transferId,
     (candidate) =>
-      void addReceiverCandidate(transferId, candidate.sdpMid ?? "", candidate.candidate),
+      void addReceiverCandidate(transferId, toStoredCandidate(candidate)).catch(() => {}),
     (state) => handlers.onStatus?.(state as TransferStatus),
     (state) => {
       if (state === "connected") handlers.onStatus?.("connected");
@@ -186,19 +179,11 @@ export async function joinTransfer(
   await update(ref(db, `transfers/${transferId}`), { receiverUid: receiver.uid });
 
   // Mirror the sender's ICE candidates into the connection.
-  const unsubscribe = onValue(
-    ref(db, `transfers/${transferId}/senderCandidates`),
-    (snap) => {
-      const candidates = snap.val() as Record<string, string> | null;
-      if (!candidates) return;
-      for (const candidate of Object.values(candidates)) {
-        void peer.addIceCandidate({ candidate }).catch((err: unknown) => {
-          handlers.onError?.(
-            `ICE candidate failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-    },
+  const unsubscribe = mirrorRemoteCandidates(
+    transferId,
+    "senderCandidates",
+    peer,
+    handlers.onError,
   );
 
   const channel = await peer.waitForDataChannel(CONNECTION_TIMEOUT_MS);

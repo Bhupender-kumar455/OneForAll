@@ -26,6 +26,17 @@ export interface TransferFile {
 }
 
 /**
+ * One ICE candidate as persisted in Firebase.  The full triple is stored
+ * because `addIceCandidate` rejects a candidate that has neither `sdpMid` nor
+ * `sdpMLineIndex`.
+ */
+export interface StoredCandidate {
+  candidate: string;
+  sdpMid: string | null;
+  sdpMLineIndex: number | null;
+}
+
+/**
  * The slice of `RTCDataChannel` the transfer layer actually uses.  Typing the
  * dependency structurally (instead of importing the DOM class) keeps the
  * protocol logic unit-testable with a plain stub channel.

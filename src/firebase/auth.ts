@@ -6,61 +6,58 @@
  * registration is required from the user, which matches the MVP's privacy
  * goal ("create a transfer from a browser without creating an account").
  */
-import { getAuth, signInAnonymously } from "firebase/auth";
+import { getAuth, signInAnonymously, type Auth, type User } from "firebase/auth";
 import { getFirebaseApp } from "./config";
 
-let cachedAuth: ReturnType<typeof getAuth> | null = null;
+let cachedAuth: Auth | null = null;
 
-
-export function getFirebaseAuth() {
+export function getFirebaseAuth(): Auth {
   if (cachedAuth) return cachedAuth;
   cachedAuth = getAuth(getFirebaseApp());
   return cachedAuth;
 }
 
-let cachedUser: any = null;
+let cachedUser: User | null = null;
+let pending: Promise<User> | null = null;
 
-export function waitForAuthUser(): Promise<any> {
-  const auth = getFirebaseAuth();
-  const current = auth.currentUser;
-  if (current) return Promise.resolve(current);
-
-  return new Promise((resolve, reject) => {
-    const unsub = auth.onAuthStateChanged((user) => {
-      unsub();
-      if (user) {
-        cachedUser = user;
-        resolve(user);
-      } else {
-        reject(new Error("User signed out before auth resolved"));
-      }
-    });
-
-    // Trigger a sign-in so we are guaranteed a UID to write with.  This is a
-    // no-op when the user is already signed in, and it is the only way to
-    // bootstrap an anonymous session in a fresh tab.
-    signInAnonymously(auth)
-      .then(() => {
-        const resolved = auth.currentUser;
-        if (resolved) {
-          cachedUser = resolved;
-          resolve(resolved);
-        } else {
-          reject(new Error("Auth failed to produce a user"));
-        }
+/**
+ * Resolve to a signed-in user, signing in anonymously if necessary.
+ *
+ * If the anonymous provider is not enabled in the Firebase console, or the
+ * `authDomain` is missing from the config, the SDK rejects this quickly and
+ * the reason surfaces to the caller as the transfer's error message.
+ *
+ * The promise is cached so several callers (the sender and the receiver both
+ * ask) trigger only one sign-in.
+ */
+export function waitForAuthUser(): Promise<User> {
+  const existing = cachedUser ?? getFirebaseAuth().currentUser;
+  if (existing) {
+    cachedUser = existing;
+    return Promise.resolve(existing);
+  }
+  if (!pending) {
+    pending = signInAnonymously(getFirebaseAuth())
+      .then((credential) => {
+        cachedUser = credential.user;
+        return credential.user;
       })
-      .catch((err) => {
-        reject(err);
+      .catch((err: unknown) => {
+        // Let a later attempt retry rather than caching the failure forever.
+        pending = null;
+        throw err;
       });
-  });
+  }
+  return pending;
 }
 
-export function signOut() {
+export function signOut(): Promise<void> {
   const auth = getFirebaseAuth();
   cachedUser = null;
+  pending = null;
   return auth.signOut();
 }
 
-export function getCachedUser(): any | null {
+export function getCachedUser(): User | null {
   return cachedUser;
 }
