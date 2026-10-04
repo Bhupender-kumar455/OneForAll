@@ -27,6 +27,8 @@ type Phase =
       error: string | null;
       done: boolean;
       shareUrl: string | null;
+      /** Receiver only: whether the reassembled file matched the sender's digest. */
+      verified: boolean | null;
     };
 
 function formatBytes(bytes: number): string {
@@ -40,11 +42,6 @@ function formatBytes(bytes: number): string {
 function transferIdFromUrl(): string | null {
   if (typeof window === "undefined") return null;
   return new URLSearchParams(window.location.search).get("t");
-}
-
-function shareUrlFor(transferId: string): string {
-  const base = import.meta.env.BASE_URL.replace(/\/$/, "");
-  return `${window.location.origin}${base}/transfer?t=${transferId}`;
 }
 
 function statusLabel(status: TransferStatus): string {
@@ -99,6 +96,7 @@ export default function TransferPage() {
         error: null,
         done: false,
         shareUrl: null,
+        verified: null,
       });
       try {
         const handle = await startTransfer(file, {
@@ -110,9 +108,11 @@ export default function TransferPage() {
           onError: (message) => sessionUpdate({ status: "failed", error: message }),
         });
         handleRef.current = handle;
+        // The link is ready now, even though the other browser has not shown
+        // up yet — the handshake runs in the background.
         sessionUpdate({
           transferId: handle.transferId,
-          shareUrl: shareUrlFor(handle.transferId),
+          shareUrl: handle.shareUrl,
         });
       } catch (err: unknown) {
         sessionUpdate({
@@ -136,6 +136,7 @@ export default function TransferPage() {
         error: null,
         done: false,
         shareUrl: null,
+        verified: null,
       });
       try {
         const handle = await joinTransfer(transferId, {
@@ -143,6 +144,7 @@ export default function TransferPage() {
           onProgress: (got, total) =>
             sessionUpdate({ progress: total ? Math.round((got / total) * 100) : 0 }),
           onFileStart: (name, size) => sessionUpdate({ file: { name, size } }),
+          onVerified: (ok) => sessionUpdate({ verified: ok }),
           onComplete: () => sessionUpdate({ done: true, status: "completed", progress: 100 }),
           onCancelled: () => sessionUpdate({ status: "cancelled", error: "Transfer cancelled." }),
           onError: (message) => sessionUpdate({ status: "failed", error: message }),
@@ -354,7 +356,9 @@ export default function TransferPage() {
             {phase.done && (
               <p className="mt-6 rounded-lg border border-border bg-muted/40 p-3 text-sm">
                 {phase.role === "receiver"
-                  ? "The file was reconstructed and downloaded."
+                  ? phase.verified === true
+                    ? "The file was reconstructed, verified against the sender's checksum, and downloaded."
+                    : "The file was reconstructed and downloaded."
                   : "The file was delivered."}
               </p>
             )}

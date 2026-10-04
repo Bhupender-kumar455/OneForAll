@@ -30,6 +30,8 @@ export class Peer {
   private readonly transferId: TransferId;
   private readonly _pc: RTCPeerConnection;
   private _dataChannel: RTCDataChannel | null = null;
+  /** Resolved the instant `ondatachannel` fires, so no frame can be missed. */
+  private channelWaiter: ((channel: RTCDataChannel) => void) | null = null;
   private readonly onIceCandidate: (candidate: RTCIceCandidate) => void;
   private readonly onIceConnectionState: (state: string) => void;
   private readonly onConnectionStateChange: (state: string) => void;
@@ -50,6 +52,11 @@ export class Peer {
     this._pc.ondatachannel = (event: RTCDataChannelEvent) => {
       this._dataChannel = event.channel;
       this.installChannelLogging(event.channel);
+      // Hand the channel over synchronously: the sender only starts once the
+      // channel is open, and waiting a poll interval would risk dropping the
+      // first frames if the receiver attached its handler too late.
+      this.channelWaiter?.(event.channel);
+      this.channelWaiter = null;
     };
 
     this._pc.onicecandidate = (event: RTCPeerConnectionIceEvent) => {
@@ -154,19 +161,14 @@ export class Peer {
   public waitForDataChannel(timeoutMs = 30_000): Promise<RTCDataChannel> {
     if (this._dataChannel) return Promise.resolve(this._dataChannel);
     return new Promise((resolve, reject) => {
-      const started = Date.now();
-      const poll = () => {
-        if (this._dataChannel) {
-          resolve(this._dataChannel);
-          return;
-        }
-        if (Date.now() - started > timeoutMs) {
-          reject(new Error("Timed out waiting for the DataChannel"));
-          return;
-        }
-        setTimeout(poll, 50);
+      const timer = setTimeout(() => {
+        this.channelWaiter = null;
+        reject(new Error("Timed out waiting for the DataChannel"));
+      }, timeoutMs);
+      this.channelWaiter = (channel) => {
+        clearTimeout(timer);
+        resolve(channel);
       };
-      poll();
     });
   }
 

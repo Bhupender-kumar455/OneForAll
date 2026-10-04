@@ -5,13 +5,17 @@
  * Database, then open a DataChannel and stream the file with backpressure:
  *
  *   Sender A                                   Receiver B
- *   createTransferRecord()  -> transfers/{id}
+ *   createTransferRecord()  -> transfers/{id}   (+ the offer; the share link
+ *                                                 is available immediately)
  *   open share link -------------------------->
- *                                              load + adopt receiverUid
- *   createOffer()          -> offer ---------->
- *                                              acceptOffer() -> answer
- *   acceptAnswer()         <- answer ----------
+ *                                               load + claim the transfer
+ *   acceptAnswer()         <- answer ----------  acceptOffer()
  *   once open: file-start/chunk/file-complete ->  reassemble + download
+ *
+ * IMPORTANT: `startTransfer` and `joinTransfer` return as soon as the session
+ * exists.  They must NOT wait for the peer to show up — the sender is how the
+ * other side is invited at all, so blocking on the answer would deadlock the
+ * UI.  The handshake runs in the background and reports through the handlers.
  */
 import { waitForAuthUser } from "../firebase/auth";
 import {
@@ -30,6 +34,7 @@ import {
   writeTransferStatus,
   type TransferDto,
 } from "../firebase/database";
+import { sha256Blob, sha256File } from "./checksum";
 import { mirrorRemoteCandidates, toStoredCandidate } from "./ice";
 import { Peer } from "./peer";
 import { DataReceiver } from "./receiver";
@@ -43,20 +48,28 @@ export type TransferProgress = {
   onCancelled?: (reason: string) => void;
   onError?: (message: string) => void;
   onFileStart?: (name: string, size: number, mime: string) => void;
+  /**
+   * The receiver checked the file it reassembled against the digest the
+   * sender published.  `expected` is undefined for older records that predate
+   * checksums, in which case the digest could not be confirmed either way.
+   */
+  onVerified?: (ok: boolean, actual: string, expected?: string) => void;
 };
 
 export interface Handle {
   transferId: TransferId;
-  status: TransferStatus;
+  /** The URL the other device opens. Only the sender has one. */
+  shareUrl: string | null;
   cancel: (reason?: string) => void;
 }
 
-const ANSWER_TIMEOUT_MS = 60_000;
+/** How long to wait for the other browser before giving up. */
+const PEER_TIMEOUT_MS = 5 * 60_000;
 const CONNECTION_TIMEOUT_MS = 60_000;
 
 /**
- * Sender entry point: publish the transfer record, produce the offer, wait for
- * the receiver's answer, then stream the file once the channel opens.
+ * Sender entry point.  Publishes the record and the offer, then returns the
+ * share link straight away; the answer/ICE/transfer happen in the background.
  */
 export async function startTransfer(
   file: File,
@@ -73,7 +86,7 @@ export async function startTransfer(
     name: file.name,
     size: file.size,
     mime: file.type || "application/octet-stream",
-    checksum: await sha256(file),
+    checksum: await sha256File(file),
   };
 
   const transferId = await createTransferRecord(owner.uid, transferFile);
@@ -93,18 +106,6 @@ export async function startTransfer(
   if (!offer.sdp) throw new Error("Failed to create a WebRTC offer");
   await writeTransferOffer(transferId, offer.sdp);
 
-  // Wait for the receiver's answer (or a cancellation / timeout).
-  const answerSdp = await waitForAnswer(transferId);
-  await peer.acceptAnswer({ type: "answer", sdp: answerSdp });
-
-  // Mirror the receiver's ICE candidates into the connection.
-  const unsubscribe = mirrorRemoteCandidates(
-    transferId,
-    "receiverCandidates",
-    peer,
-    handlers.onError,
-  );
-
   const senderOptions: SenderOptions = {
     onStatus: (status) => handlers.onStatus?.(status as TransferStatus),
     onProgress: handlers.onProgress,
@@ -114,34 +115,57 @@ export async function startTransfer(
   };
   const sender = new DataSender(transferId, channel, file, senderOptions);
 
-  // Run asynchronously: the UI should show "waiting" until the channel opens.
+  let cancelled = false;
+  let unsubscribe: (() => void) | null = null;
+
+  const teardown = (reason?: string): void => {
+    if (cancelled) return;
+    cancelled = true;
+    unsubscribe?.();
+    sender.cancel(reason);
+    peer.close();
+    void deleteTransfer(transferId);
+  };
+
+  // Background handshake.  The share link is already usable by the time the
+  // caller renders it, so everything below is allowed to take minutes.
   void (async () => {
     try {
+      const answerSdp = await waitForAnswer(transferId, PEER_TIMEOUT_MS, () => cancelled);
+      if (cancelled) return;
+
+      await peer.acceptAnswer({ type: "answer", sdp: answerSdp });
+      unsubscribe = mirrorRemoteCandidates(
+        transferId,
+        "receiverCandidates",
+        peer,
+        handlers.onError,
+      );
+
       await peer.waitForChannelOpen(channel, CONNECTION_TIMEOUT_MS);
+      if (cancelled) return;
+
       await writeTransferStatus(transferId, "transferring");
       await sender.sendFile();
+      // Reach a terminal state so the record does not look in-flight forever.
+      if (!cancelled && !sender.isCancelled) {
+        void writeTransferStatus(transferId, "completed").catch(() => {});
+      }
     } catch (err: unknown) {
-      handlers.onError?.(
-        err instanceof Error ? err.message : String(err),
-      );
+      if (cancelled) return;
+      handlers.onError?.(err instanceof Error ? err.message : String(err));
       handlers.onStatus?.("failed");
     }
   })();
 
-  function teardown(reason?: string): void {
-    unsubscribe();
-    sender.cancel(reason);
-    peer.close();
-    void deleteTransfer(transferId);
-  }
-
   handlers.onStatus?.("waiting");
-  return { transferId, status: "waiting", cancel: teardown };
+  return { transferId, shareUrl: shareUrlFor(transferId), cancel: teardown };
 }
 
 /**
- * Receiver entry point: adopt the transfer, answer the sender's offer and
- * reassemble the incoming file.
+ * Receiver entry point.  Claims the transfer, answers the offer, and resolves
+ * once the sender's channel has arrived.  Waiting here is safe because the
+ * sender is already open in someone else's browser.
  */
 export async function joinTransfer(
   transferId: TransferId,
@@ -160,7 +184,8 @@ export async function joinTransfer(
   if (dto.receiverUid && dto.receiverUid !== receiver.uid) {
     throw new Error("Another receiver already claimed this transfer.");
   }
-  const offerSdp = await waitForOffer(transferId, dto);
+
+  const offerSdp = await waitForOffer(transferId, dto, PEER_TIMEOUT_MS);
   if (!offerSdp) throw new Error("The sender never published an offer.");
 
   const peer = new Peer(
@@ -173,12 +198,12 @@ export async function joinTransfer(
     },
   );
 
+  // Claim the slot before answering so a second tab cannot take it too.
+  await update(ref(db, `transfers/${transferId}`), { receiverUid: receiver.uid });
   const answer = await peer.acceptOffer({ type: "offer", sdp: offerSdp });
   if (!answer.sdp) throw new Error("Failed to create a WebRTC answer");
   await writeTransferAnswer(transferId, answer.sdp);
-  await update(ref(db, `transfers/${transferId}`), { receiverUid: receiver.uid });
 
-  // Mirror the sender's ICE candidates into the connection.
   const unsubscribe = mirrorRemoteCandidates(
     transferId,
     "senderCandidates",
@@ -187,22 +212,41 @@ export async function joinTransfer(
   );
 
   const channel = await peer.waitForDataChannel(CONNECTION_TIMEOUT_MS);
+  const expected = dto.file.checksum;
+
   const dataReceiver = new DataReceiver(transferId, channel, {
     onStatus: (status) => handlers.onStatus?.(status as TransferStatus),
     onProgress: handlers.onProgress,
-    onComplete: (blob, name) => {
-      downloadBlob(blob, name);
-      handlers.onComplete?.();
-    },
     onCancelled: handlers.onCancelled,
     onError: handlers.onError,
     onFileStart: handlers.onFileStart,
+    onComplete: (blob, name) => {
+      // Verify before handing the file over: a corrupted transfer must not be
+      // saved as if it were good.
+      void (async () => {
+        const actual = await sha256Blob(blob);
+        const ok = expected ? actual === expected : true;
+        handlers.onVerified?.(ok, actual, expected);
+
+        if (!ok) {
+          handlers.onError?.(
+            "The received file failed its integrity check and was not saved.",
+          );
+          handlers.onStatus?.("failed");
+          return;
+        }
+
+        downloadBlob(blob, name);
+        void writeTransferStatus(transferId, "completed").catch(() => {});
+        handlers.onComplete?.();
+      })();
+    },
   });
 
   handlers.onStatus?.("waiting");
   return {
     transferId,
-    status: "waiting",
+    shareUrl: null,
     cancel: (reason?: string) => {
       unsubscribe();
       dataReceiver.cancel(reason);
@@ -214,42 +258,72 @@ export async function joinTransfer(
 
 // ── Firebase waiters ────────────────────────────────────────────────────
 
-function waitForAnswer(transferId: TransferId): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const unsub = onValue(ref(db, `transfers/${transferId}/answer`), (snap) => {
-      const answer = snap.val() as string | null;
-      if (typeof answer === "string" && answer.length > 0) {
-        unsub();
-        clearTimeout(timer);
-        resolve(answer);
-      }
+/** Poll for a value that the other browser may not have written yet. */
+function waitForValue(
+  transferId: TransferId,
+  path: "offer" | "answer",
+  timeoutMs: number,
+  isCancelled?: () => boolean,
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let poll: ReturnType<typeof setInterval> | undefined;
+
+    // `finish` only ever runs from a callback or timer below, so `timer` and
+    // `unsubscribe` are always assigned by the time it is called.
+    const finish = (value: string | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (poll) clearInterval(poll);
+      unsubscribe();
+      resolve(value);
+    };
+
+    const unsubscribe = onValue(ref(db, `transfers/${transferId}/${path}`), (snap) => {
+      const value = snap.val() as string | null;
+      if (typeof value === "string" && value.length > 0) finish(value);
     });
-    const timer = setTimeout(() => {
-      unsub();
-      reject(new Error("The receiver did not answer in time."));
-    }, ANSWER_TIMEOUT_MS);
+
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    // Stop waiting early when the user cancels the session.
+    if (isCancelled) {
+      poll = setInterval(() => {
+        if (isCancelled()) finish(null);
+      }, 500);
+    }
+  });
+}
+
+function waitForAnswer(
+  transferId: TransferId,
+  timeoutMs: number,
+  isCancelled?: () => boolean,
+): Promise<string> {
+  return waitForValue(transferId, "answer", timeoutMs, isCancelled).then((value) => {
+    if (value) return value;
+    throw new Error(
+      isCancelled?.()
+        ? "The transfer was cancelled."
+        : "The other device never connected. The link may have expired.",
+    );
   });
 }
 
 function waitForOffer(
   transferId: TransferId,
   dto: TransferDto,
+  timeoutMs: number,
 ): Promise<string | null> {
   if (dto.offer) return Promise.resolve(dto.offer);
-  return new Promise((resolve, reject) => {
-    const unsub = onValue(ref(db, `transfers/${transferId}/offer`), (snap) => {
-      const offer = snap.val() as string | null;
-      if (typeof offer === "string" && offer.length > 0) {
-        unsub();
-        clearTimeout(timer);
-        resolve(offer);
-      }
-    });
-    const timer = setTimeout(() => {
-      unsub();
-      reject(new Error("The sender did not publish an offer in time."));
-    }, ANSWER_TIMEOUT_MS);
-  });
+  return waitForValue(transferId, "offer", timeoutMs);
+}
+
+/** The URL the receiver opens; mirrors the route in `App.tsx`. */
+function shareUrlFor(transferId: TransferId): string {
+  const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+  return `${window.location.origin}${base}/transfer?t=${transferId}`;
 }
 
 /** Save a received blob to disk via a temporary object URL. */
@@ -262,13 +336,4 @@ function downloadBlob(blob: Blob, name: string): void {
   anchor.click();
   document.body.removeChild(anchor);
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
-}
-
-/** SHA-256 hex digest of the whole file, used for integrity verification. */
-async function sha256(file: File): Promise<string> {
-  const buffer = await file.arrayBuffer();
-  const digest = await crypto.subtle.digest("SHA-256", buffer);
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
 }
