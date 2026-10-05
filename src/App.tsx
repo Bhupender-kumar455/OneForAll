@@ -4,6 +4,7 @@ import { Route, Switch, useLocation, Router as WouterRouter } from "wouter";
 import { ErrorBoundary } from "@/components/error-boundary";
 import FormatterPage from "@/pages/formatter";
 import NotFound from "@/pages/not-found";
+import CodeRunnerPage from "@/pages/code-runner";
 import TextExtractor from "@/pages/text-extractor";
 import TransferPage from "@/pages/transfer";
 
@@ -21,6 +22,7 @@ function Router() {
         <Route path="/" component={FormatterPage} />
         <Route path="/extract" component={TextExtractor} />
         <Route path="/transfer" component={TransferPage} />
+        <Route path="/run" component={CodeRunnerPage} />
         <Route component={NotFound} />
       </Switch>
     </RoutedErrorBoundary>

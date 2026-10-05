@@ -1,6 +1,6 @@
 # Code Compact
 
-A local-first toolbox with three tools that share one shell:
+A local-first toolbox with four tools that share one shell:
 
 - **Code Formatter & Beautifier** — paste code, pick a language, get clean,
   consistently formatted output, with an optional Minify mode.
@@ -8,9 +8,14 @@ A local-first toolbox with three tools that share one shell:
   inside it, using OCR (Tesseract) compiled to WebAssembly.
 - **Transfer** — send a file directly to another browser over WebRTC. The
   bytes never touch a server; Firebase only coordinates the connection.
+- **Code Runner** — write a program, choose one of 15 languages, and run it in
+  a remote sandbox. This is the one tab that sends anything anywhere: your
+  source and stdin go to a server-side execution provider, and nothing else
+  does.
 
-Everything runs in the browser. No source and no image is ever uploaded, and
-the OCR engine's own assets are self-hosted so recognition works fully offline.
+Everything else runs in the browser. No source is uploaded outside the Code
+Runner, no image is ever uploaded, and the OCR engine's own assets are
+self-hosted so recognition works fully offline.
 
 Formatting runs in a Web Worker, so the editor keeps responding while a document
 is rewritten, and a newer edit cancels the work in flight instead of queueing
@@ -32,7 +37,7 @@ pnpm dev              # dev server            -> http://localhost:23084
 pnpm build            # vendor OCR assets, then build to dist/
 pnpm serve            # preview the built app -> http://localhost:23084
 pnpm typecheck        # tsc --noEmit
-pnpm test             # formatter, diff and OCR preparation tests
+pnpm test             # formatter, runner, diff, OCR and transfer tests
 pnpm vendor:ocr       # re-download the OCR runtime (pnpm vendor:ocr deu … for a subset)
 ```
 
@@ -44,8 +49,11 @@ the usual way, e.g. `PORT=4000 pnpm dev`.
 
 ```
 index.html                 Vite entry document
-vite.config.ts             dev server, build output, aliases
+vite.config.ts             dev server, build output, aliases, the local mount of
+                           `api/execute.ts`
 vercel.json                deployment: builds `pnpm build`, serves `dist/`
+api/
+  execute.ts               the Code Runner's execution boundary (Vercel Function)
 scripts/
   vendor-tesseract.mjs     copies the OCR worker + WASM cores and downloads
                            language data into public/tesseract (gitignored)
@@ -59,10 +67,13 @@ src/
     site-header.tsx        tabs, theme toggle
     panel.tsx              the shared panel chrome used by every panel
     error-boundary.tsx     render-error boundary, resettable per route
+    runner/
+      runner-editor.tsx    Monaco, assembled for exactly this app
   pages/
     formatter.tsx          the formatter + beautifier page
     text-extractor.tsx     the screenshot OCR page
     transfer.tsx           the P2P file transfer page
+    code-runner.tsx        the code execution page
     not-found.tsx          404
   firebase/
     config.ts              app init + isConfigured() (env-driven, optional)
@@ -87,6 +98,13 @@ src/
     ocr/
       ocr.ts               Tesseract client (lazy worker, reused per language)
       ocr-image.ts         screenshot preparation before recognition
+    runner/
+      types.ts             the runner's vocabulary — no provider names in it
+      limits.ts            submission/output ceilings, server-side only
+      normalize.ts         provider submission -> our ExecutionResult
+      api-core.ts          validation, payload building, rate limiting, origin
+      execute-client.ts    the browser's side of /api/execute
+      data/languages.ts    the 15-language catalogue, provider ids included
 ```
 
 ## Formatting engines
@@ -126,17 +144,72 @@ Fourteen languages ship with the app (English by default). Images up to 25 MB ar
 accepted; frames above ~2.5M pixels skip the upscale, and above 40M pixels are
 passed to the engine untouched to keep memory bounded.
 
+## Code Runner
+
+`/run` writes a program in Monaco, takes stdin, and executes it in a remote
+sandbox. The browser never runs the submitted code; it posts to `/api/execute`
+and renders what comes back.
+
+The endpoint ([api/execute.ts](api/execute.ts)) is a Vercel Function with three
+jobs: validate the request against limits the caller cannot influence, attach
+the provider credential, and normalize the answer. The provider is
+[Judge0 CE](https://ce.judge0.com) — 15 languages, from Python and JavaScript to
+C, C++, Java, Go, Rust, SQL and Bash. Nothing about the provider (its URL, its
+field names, its errors, its token) is visible to the browser, so it can be
+swapped or self-hosted without touching the UI.
+
+**This is the one part of the app that leaves your machine.** The formatter, the
+text extractor and the transfer tab never send anything; the Code Runner sends
+your source and stdin to the execution provider, which is what running code
+somewhere else means. The tab says so on the page rather than pretending
+otherwise.
+
+Limits are enforced server-side, never from the request body: 200 KB of source,
+50 KB of stdin, 20 KB of any one output stream and a 20 s provider wait, plus
+the provider's own 3 s CPU / 5 s wall / 128 MB per run.
+
+Running it locally needs no deployment: `pnpm dev` and `pnpm serve` mount the
+same handler on `/api/execute`, so the local and deployed paths share one
+implementation of the validation, the limits and the provider call.
+
+```bash
+pnpm dev          # then open http://localhost:23084/run
+```
+
+Optional server-side settings (in `.env` for local work, or the Vercel
+project's environment) — note the missing `VITE_` prefix, these never reach the
+browser:
+
+```bash
+JUDGE0_BASE_URL=https://ce.judge0.com   # point at your own Judge0 instance
+JUDGE0_AUTH_TOKEN=                      # only if that instance requires one
+RUNNER_MAX_SOURCE_BYTES=200000          # ceilings, read on every request
+RUNNER_MAX_STDIN_BYTES=50000
+RUNNER_MAX_OUTPUT_CHARS=20000
+RUNNER_WAIT_SECONDS=20
+```
+
+The public CE instance needs no account, which is why the runner works out of
+the box — and why it is rate-limited to 12 submissions a minute per caller.
+
+On a static-only host there is no `/api/execute`. The tab detects that, says so,
+and disables Run instead of failing on the first click; the other three tabs are
+unaffected.
+
 ## Tests
 
 `pnpm test` runs everything under `src/**/*.test.ts` with Node's built-in test
 runner: formatter regressions per language, the line diff, the OCR image
-preparation, and the transfer protocol — chunk framing, reassembly, and an
-end-to-end sender → receiver transfer over a loopback channel.
+preparation, the runner's request validation and result normalization, and the
+transfer protocol — chunk framing, reassembly, and an end-to-end sender →
+receiver transfer over a loopback channel.
 
 ## Deployment
 
 `vercel.json` builds with `pnpm build` and serves `dist/`, rewriting every path
-to `index.html` so client-side routes work. The same settings are mirrored in
+to `index.html` so client-side routes work. `api/execute.ts` deploys alongside
+it as a Vercel Function — the Code Runner's execution boundary, and the only
+piece of this app that runs on a server. The same settings are mirrored in
 `.replit-artifact/artifact.toml` for a Replit deploy.
 
 ## Transfer

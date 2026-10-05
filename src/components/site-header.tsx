@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
 import { Link } from "wouter";
 import { Lock, Moon, Sun } from "lucide-react";
 
 import { BUTTON_BASE } from "@/lib/styles";
+import { toggleTheme, useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 
 /**
@@ -14,23 +14,16 @@ const BRAND = "OneForAll";
 const BRAND_DECORATED = "▂▃▅▇█▓▒░ OneForAll ░▒▓█▇▅▃▂";
 
 /**
- * Top bar shared by every page. It owns the theme preference (persisted under
- * the same `cc-theme` key the formatter has always used) and the tab navigation
- *    between the code formatter, the text extractor and the file
-    transfer view.
+ * Top bar shared by every page. It reads and flips the shared theme store (see
+ * `@/lib/theme`) and the tab navigation between the formatter, the text
+ * extractor, the code runner and the file transfer view.
  */
-export function SiteHeader({ active }: { active: "code" | "extract" | "transfer" }) {
-  const [dark, setDark] = useState(() => {
-    if (typeof window === "undefined") return false;
-    const stored = window.localStorage.getItem("cc-theme");
-    if (stored) return stored === "dark";
-    return window.matchMedia("(prefers-color-scheme: dark)").matches;
-  });
-
-  useEffect(() => {
-    document.documentElement.classList.toggle("dark", dark);
-    window.localStorage.setItem("cc-theme", dark ? "dark" : "light");
-  }, [dark]);
+export function SiteHeader({
+  active,
+}: {
+  active: "code" | "extract" | "transfer" | "run";
+}) {
+  const dark = useTheme() === "dark";
 
   const tabClass = (isActive: boolean) =>
     cn(
@@ -63,6 +56,9 @@ export function SiteHeader({ active }: { active: "code" | "extract" | "transfer"
             <Link href="/transfer" className={tabClass(active === "transfer")}>
               Transfer
             </Link>
+            <Link href="/run" className={tabClass(active === "run")}>
+              Code Runner
+            </Link>
             {active === "code" && (
               <span className="hidden items-center gap-1 md:flex">
                 <a
@@ -87,7 +83,7 @@ export function SiteHeader({ active }: { active: "code" | "extract" | "transfer"
           </span>
           <button
             type="button"
-            onClick={() => setDark((value) => !value)}
+            onClick={toggleTheme}
             aria-label="Toggle theme"
             data-testid="button-toggle-theme"
             className={cn(BUTTON_BASE, "h-9 w-9 border border-border hover:bg-muted")}
