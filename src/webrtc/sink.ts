@@ -7,10 +7,22 @@
  * path holds a single buffer and the disk path (Origin Private File System)
  * holds almost nothing regardless of file size.
  */
-import { sha256Hex, sha256Streamed } from "./checksum.ts";
-
-/** Upper bound on a single transfer, matching the record validation. */
+/**
+ * Largest payload a memory sink will hold.
+ *
+ * This is a RAM ceiling, not a protocol one: `MemorySink` allocates the whole
+ * file as a single buffer. A disk sink streams instead and is limited by the
+ * disk's quota, which is why the receiver validates against the sink it got
+ * rather than against this number.
+ */
 export const MAX_TRANSFER_BYTES = 1_000_000_000;
+
+/** Compact size for user-facing errors; `lib/bytes` stops at megabytes. */
+function describeSize(bytes: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const step = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${parseFloat((bytes / 1024 ** step).toFixed(1))} ${units[step]}`;
+}
 
 /** Disk entries older than this are leftovers from an interrupted session. */
 const STALE_ENTRY_MS = 60 * 60 * 1000;
@@ -21,10 +33,14 @@ export interface TransferSink {
   readonly kind: "disk" | "memory";
   /** Copy one chunk to its byte offset. Rejects if it would overrun. */
   write(offset: number, data: Uint8Array): Promise<void>;
-  /** Seal the sink and return the finished payload. */
+  /**
+   * Seal the sink and return the finished payload.
+   *
+   * There is no whole-payload digest here by design: integrity is settled one
+   * chunk at a time as the bytes arrive (see `checksum.ts`), so sealing is the
+   * last step rather than the start of a second pass over the file.
+   */
   finish(): Promise<Blob>;
-  /** SHA-256 of the finished payload. */
-  digest(): Promise<string>;
   /** Release any temporary storage. Safe to call more than once. */
   dispose(): Promise<void>;
 }
@@ -54,11 +70,6 @@ class MemorySink implements TransferSink {
 
   public async finish(): Promise<Blob> {
     return new Blob([this.buffer]);
-  }
-
-  /** Digest the buffer in place: no second copy of the file is made. */
-  public async digest(): Promise<string> {
-    return sha256Hex(this.buffer.buffer);
   }
 
   public async dispose(): Promise<void> {
@@ -144,14 +155,6 @@ class DiskSink implements TransferSink {
     return this.seal();
   }
 
-  /**
-   * Hash the file from disk one window at a time, so verification does not put
-   * the whole payload back on the heap.
-   */
-  public async digest(): Promise<string> {
-    return sha256Streamed(await this.seal());
-  }
-
   public async dispose(): Promise<void> {
     if (!this.closed) {
       try {
@@ -206,6 +209,14 @@ export async function createSink(
     } catch {
       // Private mode, quota, or unsupported: the memory sink still works.
     }
+  }
+  // Refuse before allocating. Handing a multi-gigabyte size to `new
+  // Uint8Array()` would either throw or take the tab down with it.
+  if (totalSize > MAX_TRANSFER_BYTES) {
+    throw new Error(
+      `This browser cannot stream to disk, so a ${describeSize(totalSize)} file ` +
+        `would have to be held in memory; the limit is ${describeSize(MAX_TRANSFER_BYTES)}.`,
+    );
   }
   return new MemorySink(totalSize);
 }

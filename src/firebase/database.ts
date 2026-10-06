@@ -10,19 +10,26 @@
  * transfers/{transferId}
  *   ownerUid:     UID of the sender who created the transfer
  *   receiverUid:  UID of the assigned receiver (null until the receiver joins)
- *   file:         { name, size, mime, checksum }  (UI metadata, see 5.2)
+ *   file:         { name, size, mime }  (UI metadata, see 5.2; no digest —
+ *                 integrity travels per chunk in the DataChannel frames)
  *   status:       waiting | connecting | connected | transferring | completed
  *                 | cancelled | failed | expired
  *   createdAt:    epoch ms
  *   expiresAt:    epoch ms (30-60 min for MVP, see 8.3)
  *   offer:        SDP description (until negotiation completes)
  *   answer:       SDP description
- *   senderCandidates: { [candidateId]: string }
- *   receiverCandidates: { [candidateId]: string }
+ *   senderCandidates/{round}:   { [candidateId]: StoredCandidate }
+ *   receiverCandidates/{round}: { [candidateId]: StoredCandidate }
  *   bytesReceived: number  (transfer metrics, see 5.2)
+ *
+ * Candidates are scoped per negotiation round. A resumed transfer negotiates a
+ * brand new peer connection, and the previous round's candidates belong to an
+ * SDP the new connection does not know about — feeding them back would reject
+ * with a confusing ICE error on every resume.
  */
 
 import { ref, get, set, update, onValue, remove } from "firebase/database";
+import { MAX_DECLARED_BYTES } from "../webrtc/protocol";
 import { getDatabase } from "firebase/database";
 import { waitForAuthUser } from "./auth";
 import { getFirebaseApp, isFirebaseConfigured } from "./config";
@@ -49,10 +56,14 @@ export interface TransferDto {
   expiresAt: number;
   offer: string | null;
   answer: string | null;
-  senderCandidates: Record<string, StoredCandidate>;
-  receiverCandidates: Record<string, StoredCandidate>;
+  /** Keyed by negotiation round, then by candidate id. */
+  senderCandidates: CandidateLog;
+  receiverCandidates: CandidateLog;
   bytesReceived: number;
 }
+
+/** Candidates grouped by the negotiation round they were produced in. */
+export type CandidateLog = Record<string, Record<string, StoredCandidate>>;
 
 const EXPIRY_MINUTES = 30;
 
@@ -114,7 +125,9 @@ export function validateTransferFile(file: TransferFile): string | null {
   if (!file.name || file.name.length > 512) {
     return "Invalid file name";
   }
-  if (typeof file.size !== "number" || file.size <= 0 || file.size > 1_000_000_000) {
+  // A sanity bound, not the capacity limit: whether a file actually fits is
+  // decided on the receiving device, from the storage it can really use.
+  if (typeof file.size !== "number" || file.size <= 0 || file.size > MAX_DECLARED_BYTES) {
     return "Invalid file size";
   }
   if (!file.mime || file.mime.length > 256) {
@@ -193,10 +206,11 @@ export function writeTransferAnswer(
 export function addSenderCandidate(
   transferId: string,
   candidate: StoredCandidate,
+  round = 0,
 ): Promise<void> {
   if (!isConfigured()) return Promise.reject(new Error("Firebase not configured"));
   const id = crypto.randomUUID();
-  return update(ref(db, `transfers/${transferId}/senderCandidates`), {
+  return update(ref(db, `transfers/${transferId}/senderCandidates/${round}`), {
     [id]: candidate,
   });
 }
@@ -204,10 +218,11 @@ export function addSenderCandidate(
 export function addReceiverCandidate(
   transferId: string,
   candidate: StoredCandidate,
+  round = 0,
 ): Promise<void> {
   if (!isConfigured()) return Promise.reject(new Error("Firebase not configured"));
   const id = crypto.randomUUID();
-  return update(ref(db, `transfers/${transferId}/receiverCandidates`), {
+  return update(ref(db, `transfers/${transferId}/receiverCandidates/${round}`), {
     [id]: candidate,
   });
 }

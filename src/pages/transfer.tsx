@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SiteHeader } from "@/components/site-header";
+import { formatBytes } from "@/lib/bytes";
 import { BUTTON_BASE } from "@/lib/styles";
 import { cn } from "@/lib/utils";
 import { sweepExpiredTransfers } from "@/firebase/database";
 import { startTransfer, joinTransfer, type Handle } from "@/webrtc/signaling";
+import { formatDuration, formatSpeed, ThroughputMeter } from "@/webrtc/throughput";
 import type { TransferStatus } from "@/webrtc/types";
 
 /** How often one browser session bothers sweeping dead transfers. */
@@ -28,6 +30,12 @@ type Phase =
       transferId: string | null;
       status: TransferStatus;
       progress: number;
+      /** Bytes moved so far, for the "12.4 MB / 2.00 GB" readout. */
+      bytes: number;
+      /** Recent throughput in bytes per second, or null until it can be read. */
+      speed: number | null;
+      /** Milliseconds left, rounded to a whole second, or null while unknown. */
+      eta: number | null;
       file: { name: string; size: number } | null;
       error: string | null;
       done: boolean;
@@ -35,13 +43,6 @@ type Phase =
       /** Receiver only: whether the reassembled file matched the sender's digest. */
       verified: boolean | null;
     };
-
-function formatBytes(bytes: number): string {
-  if (bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  return `${parseFloat((bytes / 1024 ** i).toFixed(1))} ${units[i]}`;
-}
 
 /** Read `?t=<transferId>` from the current URL, if present. */
 function transferIdFromUrl(): string | null {
@@ -59,6 +60,8 @@ function statusLabel(status: TransferStatus): string {
       return "Connected — starting transfer…";
     case "transferring":
       return "Transferring…";
+    case "interrupted":
+      return "Connection lost — resuming the missing parts…";
     case "completed":
       return "Transfer complete";
     case "cancelled":
@@ -80,6 +83,11 @@ export default function TransferPage() {
   const [pickedFile, setPickedFile] = useState<File | null>(null);
   const [linkInput, setLinkInput] = useState("");
   const handleRef = useRef<Handle | null>(null);
+  // One meter for the session: its window must not outlive a transfer.
+  const meterRef = useRef(new ThroughputMeter());
+  // The highest byte count seen this session, so a resume cannot slide the bar
+  // backwards when the new connection re-reports from where it left off.
+  const highWaterRef = useRef(0);
   // Stop an in-flight session if the page unmounts.
   useEffect(() => () => handleRef.current?.cancel("Page closed"), []);
 
@@ -97,19 +105,58 @@ export default function TransferPage() {
   }, []);
 
   const sessionUpdate = useCallback((patch: Partial<Extract<Phase, { kind: "session" }>>) => {
-    setPhase((prev) =>
-      prev.kind === "session" ? { ...prev, ...patch } : prev,
-    );
+    setPhase((prev) => {
+      if (prev.kind !== "session") return prev;
+      // Bail out when every patched field already holds the new value. Progress
+      // arrives far more often than the rounded percentage moves, and spreading
+      // a fresh object each time would re-render the page for nothing — work
+      // that competes with the transfer itself.
+      const before = prev as Record<string, unknown>;
+      const after = patch as Record<string, unknown>;
+      for (const key of Object.keys(after)) {
+        if (before[key] !== after[key]) return { ...prev, ...patch };
+      }
+      return prev;
+    });
   }, []);
+
+  /**
+   * Turn a progress tick into the numbers the panel shows.
+   *
+   * The meter reads the rate from a short recent window, so a slow start does
+   * not colour the whole file, and the ETA is rounded to a second so it stops
+   * jittering between ticks.
+   */
+  const reportProgress = useCallback(
+    (done: number, total: number) => {
+      const highest = Math.max(highWaterRef.current, done);
+      highWaterRef.current = highest;
+      const meter = meterRef.current;
+      meter.sample(highest);
+      const eta = meter.remainingMs(total);
+      sessionUpdate({
+        bytes: highest,
+        progress: total ? Math.round((highest / total) * 100) : 0,
+        speed: meter.bytesPerSecond,
+        eta: eta === null ? null : Math.round(eta / 1000) * 1000,
+      });
+    },
+    [sessionUpdate],
+  );
 
   const beginSend = useCallback(
     async (file: File) => {
+      meterRef.current.reset();
+      highWaterRef.current = 0;
       setPhase({
         kind: "session",
         role: "sender",
         transferId: null,
         status: "waiting",
         progress: 0,
+        bytes: 0,
+        speed: null,
+        eta: null,
         file: { name: file.name, size: file.size },
         error: null,
         done: false,
@@ -119,9 +166,11 @@ export default function TransferPage() {
       try {
         const handle = await startTransfer(file, {
           onStatus: (status) => sessionUpdate({ status }),
-          onProgress: (sent, total) =>
-            sessionUpdate({ progress: total ? Math.round((sent / total) * 100) : 0 }),
-          onComplete: () => sessionUpdate({ done: true, status: "completed", progress: 100 }),
+          onProgress: reportProgress,
+          // The bar is full and nothing is "left", so the estimate goes away. The
+          // rate stays: at 100% it reads as the speed the transfer finished at.
+          onComplete: () =>
+            sessionUpdate({ done: true, status: "completed", progress: 100, eta: null }),
           onCancelled: () => sessionUpdate({ status: "cancelled", error: "Transfer cancelled." }),
           onError: (message) => sessionUpdate({ status: "failed", error: message }),
         });
@@ -139,17 +188,22 @@ export default function TransferPage() {
         });
       }
     },
-    [sessionUpdate],
+    [reportProgress, sessionUpdate],
   );
 
   const beginReceive = useCallback(
     async (transferId: string) => {
+      meterRef.current.reset();
+      highWaterRef.current = 0;
       setPhase({
         kind: "session",
         role: "receiver",
         transferId,
         status: "connecting",
         progress: 0,
+        bytes: 0,
+        speed: null,
+        eta: null,
         file: null,
         error: null,
         done: false,
@@ -159,11 +213,11 @@ export default function TransferPage() {
       try {
         const handle = await joinTransfer(transferId, {
           onStatus: (status) => sessionUpdate({ status }),
-          onProgress: (got, total) =>
-            sessionUpdate({ progress: total ? Math.round((got / total) * 100) : 0 }),
+          onProgress: reportProgress,
           onFileStart: (name, size) => sessionUpdate({ file: { name, size } }),
           onVerified: (ok) => sessionUpdate({ verified: ok }),
-          onComplete: () => sessionUpdate({ done: true, status: "completed", progress: 100 }),
+          onComplete: () =>
+            sessionUpdate({ done: true, status: "completed", progress: 100, eta: null }),
           onCancelled: () => sessionUpdate({ status: "cancelled", error: "Transfer cancelled." }),
           onError: (message) => sessionUpdate({ status: "failed", error: message }),
         });
@@ -176,7 +230,7 @@ export default function TransferPage() {
         });
       }
     },
-    [sessionUpdate],
+    [reportProgress, sessionUpdate],
   );
 
   // Auto-join when the page is opened from a share link.
@@ -343,7 +397,18 @@ export default function TransferPage() {
                 style={{ width: `${phase.progress}%` }}
               />
             </div>
-            <p className="mt-2 text-xs text-muted-foreground">{phase.progress}%</p>
+            <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 font-mono text-xs text-muted-foreground">
+              <span>
+                {phase.file
+                  ? `${formatBytes(phase.bytes)} / ${formatBytes(phase.file.size)}`
+                  : ""}
+              </span>
+              <span>
+                {phase.progress}%
+                {phase.speed !== null && ` · ${formatSpeed(phase.speed)}`}
+                {phase.eta !== null && phase.eta > 0 && ` · ${formatDuration(phase.eta)} left`}
+              </span>
+            </div>
 
             {phase.shareUrl && !phase.done && (
               <div className="mt-6 rounded-xl border border-border bg-muted/40 p-4">
@@ -375,7 +440,7 @@ export default function TransferPage() {
               <p className="mt-6 rounded-lg border border-border bg-muted/40 p-3 text-sm">
                 {phase.role === "receiver"
                   ? phase.verified === true
-                    ? "The file was reconstructed, verified against the sender's checksum, and downloaded."
+                    ? "Every chunk matched the digest it was sent with, so the file was reconstructed and downloaded."
                     : "The file was reconstructed and downloaded."
                   : "The file was delivered."}
               </p>

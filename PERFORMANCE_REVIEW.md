@@ -79,8 +79,8 @@ triggers anonymous auth + the Realtime Database socket:
 | `identitytoolkit …/accounts:signUp` | 1,038 ms |
 | `identitytoolkit …/accounts:lookup` | 813 ms |
 
-Previously verified in this project: 300 MB transfer → **9 MB heap growth**, checksum
-verified on both sides.
+Previously verified in this project: 300 MB transfer → **9 MB heap growth**, integrity
+verified per chunk on the receiving side (no whole-file digest pass, on either end).
 
 ### Build / test loop (developer cost)
 
@@ -190,14 +190,19 @@ risk of a stale worker after a library upgrade.
 megabytes. Two smaller wins: pre-warm the selected language on idle, and reconsider
 shipping all 14 languages (25 MB) by default.
 
-### F7 — Transfer protocol: two cheap upgrades with real value
+### F7 — Transfer protocol: both upgrades landed
 
-* **Verification re-reads the payload.** `DiskSink.digest()` streams the sealed file back
-  from OPFS in 1 MiB windows — correct and heap-safe, but it is a second full pass. Per-chunk
-  digests composed into a Merkle root would verify incrementally as chunks land, and the same
-  structure is exactly what resume (#3) needs to name the chunks it is missing.
-* **Backpressure polling.** The sender polls `bufferedAmount` every 20 ms; the
-  `bufferedamountlow` event removes the wake-ups and reacts sooner. Minor, but free.
+* **Verification no longer re-reads the payload.** `DiskSink.digest()` and the sender's
+  up-front `sha256File(file)` are both gone. Each 64 KiB chunk is digested inside the sender's
+  read-ahead window and the digest rides in the frame header, so the receiver checks the chunk
+  it is about to store and never hashes the finished file. The sender no longer reads its whole
+  file before the share link appears, and a failure names one byte offset instead of rejecting
+  "the file". Cost: 32 bytes per 64 KiB chunk (0.05%), and a resume re-sends a digest with its
+  chunk for free. A Merkle root over the chunk digests was considered and dropped — nothing
+  needs a whole-file commitment, since the digest travels with the bytes it describes.
+* **Backpressure polling.** Settled: the sender sets `bufferedAmountLowThreshold` and waits on
+  `bufferedamountlow`, with the 20 ms poll kept only as a safety net and as the drop detector on
+  channels that do not expose the event.
 
 ### F8 — Guardrails so this does not regress
 

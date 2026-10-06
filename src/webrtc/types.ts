@@ -13,16 +13,23 @@ export type TransferStatus =
   | "connecting"
   | "connected"
   | "transferring"
+  | "interrupted"
   | "completed"
   | "cancelled"
   | "failed"
   | "expired";
 
+/**
+ * The file as described in the signaling record.
+ *
+ * Deliberately no checksum: the sender must not read its whole file before the
+ * transfer can begin. Integrity is carried per chunk instead, in the frame
+ * header, so it costs nothing up front.
+ */
 export interface TransferFile {
   name: string;
   size: number;
   mime: string;
-  checksum?: string;
 }
 
 /**
@@ -37,6 +44,18 @@ export interface StoredCandidate {
 }
 
 /**
+ * A contiguous span of the file that has not been stored yet.
+ *
+ * Resume is expressed in byte ranges rather than a list of chunk offsets: a
+ * dropped connection usually leaves one long hole, so a 2 GiB file needs a
+ * handful of numbers on the wire instead of ~32,000 offsets.
+ */
+export interface ChunkRange {
+  offset: number;
+  length: number;
+}
+
+/**
  * The slice of `RTCDataChannel` the transfer layer actually uses.  Typing the
  * dependency structurally (instead of importing the DOM class) keeps the
  * protocol logic unit-testable with a plain stub channel.
@@ -45,6 +64,13 @@ export interface TransferChannel {
   readyState: RTCDataChannelState;
   bufferedAmount: number;
   binaryType: BinaryType;
+  /**
+   * Present on a real RTCDataChannel, omitted by the test stubs.  When the
+   * sender can set it, backpressure is signalled by an event instead of being
+   * discovered by polling.
+   */
+  bufferedAmountLowThreshold?: number;
+  onbufferedamountlow?: ((event: Event) => void) | null;
   onopen: ((event: Event) => void) | null;
   onmessage: ((event: MessageEvent<string | ArrayBuffer>) => void) | null;
   onclose: ((event: Event) => void) | null;
@@ -61,6 +87,13 @@ export interface TransferChannel {
 export type ControlMessage =
   | { type: "file-start"; name: string; size: number; mime: string; chunkSize: number }
   | { type: "file-complete" }
+  // Resume round: the receiver reports exactly which byte ranges it still
+  // needs, the sender announces that it is re-sending only those, and the
+  // sender probes with `resume-ready` until that request arrives (see
+  // `sender.ts`/`receiver.ts` for the handshake).
+  | { type: "resume-ready" }
+  | { type: "resume-request"; ranges: ChunkRange[] }
+  | { type: "file-resume"; ranges: ChunkRange[] }
   | { type: "cancelled"; reason: string }
   | { type: "error"; message: string };
 

@@ -15,8 +15,17 @@ export function countStats(value: string): TextStats {
   };
 }
 
+/**
+ * Human-readable byte count.
+ *
+ * Extends past megabytes so transferred files read correctly: everything below
+ * a gigabyte formats exactly as it always did, and a transfer's progress can be
+ * shown without a second formatter that stops at a different unit.
+ */
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(2)} MB`;
+  if (bytes < 1024 ** 4) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  return `${(bytes / 1024 ** 4).toFixed(2)} TB`;
 }

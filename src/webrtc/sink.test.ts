@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { sha256Hex } from "./checksum.ts";
 import { CHUNK_SIZE } from "./protocol.ts";
 import { canStreamToDisk, createSink, MAX_TRANSFER_BYTES } from "./sink.ts";
+import { MAX_DECLARED_BYTES } from "./protocol.ts";
 
 /**
  * Node has no `navigator.storage`, so `createSink` exercises the in-memory
@@ -30,9 +30,10 @@ describe("memory sink", () => {
       await sink.write(offset, file.slice(offset, offset + CHUNK_SIZE));
     }
 
-    assert.equal(await sink.digest(), await sha256Hex(file.buffer as ArrayBuffer));
     const blob = await sink.finish();
     assert.equal(blob.size, size);
+    const written = new Uint8Array(await blob.arrayBuffer());
+    assert.deepEqual(Array.from(written), Array.from(file));
     await sink.dispose();
   });
 
@@ -41,10 +42,8 @@ describe("memory sink", () => {
     const good = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
     await sink.write(0, good);
     await sink.write(0, good);
-    assert.equal(
-      await sink.digest(),
-      await sha256Hex(good.buffer as ArrayBuffer),
-    );
+    const written = new Uint8Array(await (await sink.finish()).arrayBuffer());
+    assert.deepEqual(Array.from(written), [1, 2, 3, 4, 5, 6, 7, 8]);
     await sink.dispose();
   });
 
@@ -71,7 +70,22 @@ describe("memory sink", () => {
 });
 
 describe("transfer size guard", () => {
-  it("keeps the cap at one gigabyte", () => {
+  it("keeps the memory-sink ceiling at one gigabyte", () => {
     assert.equal(MAX_TRANSFER_BYTES, 1_000_000_000);
+  });
+
+  it("sets the sanity bound well above the memory ceiling", () => {
+    // If the two were equal the disk path could never accept a large file,
+    // which is exactly the wall this replaced.
+    assert.ok(MAX_DECLARED_BYTES > MAX_TRANSFER_BYTES * 10);
+  });
+
+  it("refuses a size the memory sink cannot hold", async () => {
+    // This environment has no OPFS, so the memory path is taken and the guard
+    // must fire rather than allocating the whole file.
+    await assert.rejects(
+      () => createSink("oversize", MAX_TRANSFER_BYTES + 1),
+      /cannot stream to disk/i,
+    );
   });
 });

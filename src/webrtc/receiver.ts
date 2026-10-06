@@ -7,16 +7,25 @@
  *     completion is a counter comparison, not a scan over every offset.
  *   - Writes are chained, so a slow-disk sink cannot reorder or drop a chunk.
  */
+import { digestsMatch, sha256Bytes } from "./checksum.ts";
 import {
+  CHUNK_SIZE,
   decodeChunk,
   deserializeMessage,
+  MAX_DECLARED_BYTES,
+  missingRanges,
+  PROGRESS_INTERVAL_MS,
   serializeMessage,
 } from "./protocol.ts";
-import { createSink, MAX_TRANSFER_BYTES, type TransferSink } from "./sink.ts";
+import { createSink, type TransferSink } from "./sink.ts";
 
 type SinkFactory = (entryName: string, totalSize: number) => Promise<TransferSink>;
-import type { ControlMessage, TransferChannel, TransferId } from "./types.ts";
-import { CHUNK_SIZE } from "./protocol.ts";
+import type {
+  ChunkRange,
+  ControlMessage,
+  TransferChannel,
+  TransferId,
+} from "./types.ts";
 
 export interface ReceiverOptions {
   onStatus?: (status: string) => void;
@@ -25,19 +34,33 @@ export interface ReceiverOptions {
   onCancelled?: (reason: string) => void;
   onError?: (message: string) => void;
   onFileStart?: (name: string, size: number, mime: string) => void;
-  /** The reassembled file was compared against this digest, when provided. */
-  expectedChecksum?: string;
-  onVerified?: (ok: boolean, actual: string, expected?: string) => void;
+  /**
+   * Every chunk that arrived matched the digest it was sent with.
+   *
+   * Called once the file is complete. A chunk that fails is reported through
+   * `onError` and stops the transfer, so this only ever fires `false` alongside
+   * that failure.
+   */
+  onVerified?: (ok: boolean) => void;
   /** Override the sink, mainly so tests can simulate a slow disk. */
   sinkFactory?: SinkFactory;
+  /** The channel died before the file was complete; `ranges` is what is left. */
+  onInterrupted?: (ranges: ChunkRange[]) => void;
 }
 
 export class DataReceiver {
   private readonly transferId: TransferId;
-  private readonly channel: TransferChannel;
+  /** Rebound on every resume round by `attach`; the reassembly state persists. */
+  private channel: TransferChannel;
   private readonly options: ReceiverOptions;
 
-  private sinkPromise: Promise<TransferSink> | null = null;
+  /** Ranges a `notifyInterrupted` reported while nobody was waiting for them. */
+  private pendingInterruption: ChunkRange[] | null = null;
+  private interruptedWaiter: ((ranges: ChunkRange[] | null) => void) | null = null;
+
+  /** Resolves to null when the sink could not be created at all. */
+  private sinkPromise: Promise<TransferSink | null> | null = null;
+  private lastProgressAt = 0;
   /** Serialises sink writes so out-of-order frames cannot corrupt the file. */
   private writes: Promise<void> = Promise.resolve();
 
@@ -56,12 +79,38 @@ export class DataReceiver {
     options: ReceiverOptions = {},
   ) {
     this.transferId = transferId;
-    this.channel = channel;
     this.options = options;
+    this.channel = channel;
+    this.attach(channel);
+  }
 
-    this.channel.binaryType = "arraybuffer";
-    this.channel.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
-      this.handleFrame(event.data);
+  /**
+   * Move onto a freshly negotiated channel, keeping everything already
+   * stored. This is what makes resume work: `seen`, the sink and the byte
+   * counter all survive the reconnect, so the sender is only asked for the
+   * ranges that are genuinely absent.
+   *
+   * Handlers check that the channel they fired on is still the current one, so
+   * a late close from the replaced channel cannot trigger a bogus interruption.
+   */
+  public attach(channel: TransferChannel): void {
+    this.channel = channel;
+    channel.binaryType = "arraybuffer";
+    // Any gap reported for the channel being replaced has already been acted
+    // on. Its close event can still land after this point, and honouring it
+    // would start a second resume round while the first is still streaming.
+    this.pendingInterruption = null;
+
+    const previousMessage = channel.onmessage;
+    channel.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
+      previousMessage?.call(channel, event);
+      if (this.channel === channel) this.handleFrame(event.data);
+    };
+
+    const previousClose = channel.onclose;
+    channel.onclose = (event: Event) => {
+      previousClose?.call(channel, event);
+      if (this.channel === channel) this.notifyInterrupted();
     };
   }
 
@@ -73,10 +122,82 @@ export class DataReceiver {
     return this.received;
   }
 
+  /** The byte ranges not stored yet, or an empty list once nothing is left. */
+  public missingRanges(): ChunkRange[] {
+    if (this.totalSize <= 0 || this.complete) return [];
+    return missingRanges(this.seen, this.totalSize, CHUNK_SIZE);
+  }
+
+  /**
+   * Note that the connection went away before the file was complete.
+   *
+   * Called by the channel's own close handler and by the signaling layer when
+   * the peer connection fails. Idempotent in the sense that it reports the
+   * current gap every time; the resume loop consumes one report per round.
+   */
+  public notifyInterrupted(): void {
+    if (this._cancelled || this.complete || this.totalSize <= 0) return;
+    // Chunks whose sink writes are still queued have not been counted in
+    // `seen` yet. Computing the gap before they land would ask the sender to
+    // re-send bytes that are about to be stored — the last frames delivered
+    // before a drop are exactly the ones still in flight here.
+    this.writes = this.writes.then(() => this.reportInterruption());
+  }
+
+  /** Split out so it can run after the queued writes have been applied. */
+  private reportInterruption(): void {
+    if (this._cancelled || this.complete || this.totalSize <= 0) return;
+    const ranges = this.missingRanges();
+    if (ranges.length === 0) return;
+
+    this.options.onStatus?.("interrupted");
+    this.options.onInterrupted?.(ranges);
+
+    const waiter = this.interruptedWaiter;
+    this.interruptedWaiter = null;
+    if (waiter) waiter(ranges);
+    else this.pendingInterruption = ranges;
+  }
+
+  /**
+   * Resolve with the ranges still missing after a drop, or `null` when the
+   * transfer finished or was cancelled first.
+   */
+  public waitForInterruption(): Promise<ChunkRange[] | null> {
+    if (this._cancelled || this.complete) return Promise.resolve(null);
+    if (this.pendingInterruption) {
+      const ranges = this.pendingInterruption;
+      this.pendingInterruption = null;
+      return Promise.resolve(ranges);
+    }
+    return new Promise((resolve) => {
+      this.interruptedWaiter = resolve;
+    });
+  }
+
+  /**
+   * Ask the sender for the ranges this receiver is still missing.
+   *
+   * Returns false when there is nothing to ask for — the sender may already be
+   * sending, in which case a duplicate request is harmless but pointless.
+   */
+  public requestResume(): boolean {
+    if (this._cancelled || this.complete || this.totalSize <= 0) return false;
+    const ranges = this.missingRanges();
+    if (ranges.length === 0) return false;
+    try {
+      this.channel.send(serializeMessage({ type: "resume-request", ranges }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Ask the sender to stop, then tear down the channel. */
   public cancel(reason = "User cancelled"): void {
     if (this._cancelled) return;
     this._cancelled = true;
+    this.settleInterruption(null);
     try {
       this.channel.send(serializeMessage({ type: "cancelled", reason }));
     } catch {
@@ -85,6 +206,14 @@ export class DataReceiver {
     this.options.onCancelled?.(reason);
     this.options.onStatus?.("cancelled");
     this.channel.close();
+  }
+
+  /** Wake the resume loop with a terminal answer (finished or cancelled). */
+  private settleInterruption(value: ChunkRange[] | null): void {
+    this.pendingInterruption = null;
+    const waiter = this.interruptedWaiter;
+    this.interruptedWaiter = null;
+    waiter?.(value);
   }
 
   /** Release the sink. Safe to call once the download has finished. */
@@ -122,8 +251,22 @@ export class DataReceiver {
         this.writes = this.writes.then(() => this.completeIfDone(true));
         break;
 
+      case "file-resume":
+        // A resume continues the file already in progress, so `seen` and the
+        // sink are deliberately left alone. Only a fresh `file-start` resets.
+        this.options.onStatus?.("transferring");
+        break;
+
+      case "resume-ready":
+        // The sender is back on a new channel and does not know what it still
+        // owes; it can only be told by us. Answering every probe also covers a
+        // request that was sent before the sender started listening.
+        this.requestResume();
+        break;
+
       case "cancelled":
         this._cancelled = true;
+        this.settleInterruption(null);
         this.options.onCancelled?.(msg.reason);
         this.options.onStatus?.("cancelled");
         break;
@@ -135,11 +278,11 @@ export class DataReceiver {
   }
 
   private startFile(msg: Extract<ControlMessage, { type: "file-start" }>): void {
-    if (
-      !Number.isFinite(msg.size) ||
-      msg.size <= 0 ||
-      msg.size > MAX_TRANSFER_BYTES
-    ) {
+    // An absolute sanity bound only. The real ceiling is the sink's: a disk
+    // sink streams and is limited by the disk, a memory sink buffers and is
+    // limited by RAM. Checking the sink's limit here would reject a large file
+    // on the very browsers that could have streamed it.
+    if (!Number.isFinite(msg.size) || msg.size <= 0 || msg.size > MAX_DECLARED_BYTES) {
       this.options.onError?.(`Refusing an invalid file size (${msg.size} bytes)`);
       this.options.onStatus?.("failed");
       return;
@@ -154,24 +297,49 @@ export class DataReceiver {
     this.complete = false;
     this.writes = Promise.resolve();
     const makeSink = this.options.sinkFactory ?? createSink;
-    this.sinkPromise = makeSink(`${this.transferId}-${Date.now()}`, msg.size);
+    // A sink that cannot hold the file refuses before allocating anything, and
+    // that refusal has to reach the user rather than being thrown into a void.
+    this.pendingInterruption = null;
+    this.settleInterruption(null);
+    this.sinkPromise = makeSink(`${this.transferId}-${Date.now()}`, msg.size).catch(
+      (err: unknown) => {
+        this._cancelled = true;
+        this.settleInterruption(null);
+        this.options.onError?.(err instanceof Error ? err.message : String(err));
+        this.options.onStatus?.("failed");
+        return null;
+      },
+    );
 
     this.options.onFileStart?.(this.fileName, msg.size, this.mime);
   }
 
   private handleChunk(frame: ArrayBuffer): void {
     let offset: number;
+    let digest: Uint8Array;
     let data: Uint8Array;
     try {
-      ({ offset, data } = decodeChunk(frame));
+      ({ offset, digest, data } = decodeChunk(frame));
     } catch {
       this.options.onError?.("Malformed chunk frame from sender");
       return;
     }
 
+    // Started here rather than inside the chain below so the hash of this
+    // chunk overlaps the queued writes of the ones before it.
+    const actual = sha256Bytes(data);
+
     // Chain the write: a sink that resolves asynchronously must not interleave.
     this.writes = this.writes
       .then(async () => {
+        if (this._cancelled) return;
+        // Checked before storing, so a corrupt chunk is never written to the
+        // file and never counted as present — which would otherwise be a silent
+        // hole that the completeness check happily accepts.
+        if (!digestsMatch(digest, await actual)) {
+          this.integrityFailure(offset);
+          return;
+        }
         const sink = this.sinkPromise ? await this.sinkPromise : null;
         if (!sink || this._cancelled) return;
         await sink.write(offset, data);
@@ -179,7 +347,7 @@ export class DataReceiver {
         if (!this.seen.has(offset)) {
           this.seen.add(offset);
           this.received += data.byteLength;
-          this.options.onProgress?.(this.received, this.totalSize);
+          this.reportProgress();
         }
         this.completeIfDone();
       })
@@ -209,6 +377,8 @@ export class DataReceiver {
       return;
     }
     this.complete = true;
+    // The resume loop has nothing left to wait for.
+    this.settleInterruption(null);
     // Surface a finalise failure rather than hanging: a swallowed error here
     // would leave the transfer stuck with no explanation.
     this.writes = this.writes.then(() => this.finalise()).catch((err: unknown) => {
@@ -219,26 +389,56 @@ export class DataReceiver {
     });
   }
 
+  /**
+   * Report progress, coalesced to `PROGRESS_INTERVAL_MS`.
+   *
+   * One callback per 64 KiB chunk is ~32,000 state updates for a 2 GiB file,
+   * and a UI that re-renders on each of them starves the receive path. `force`
+   * and reaching the end always emit, so the bar still ends at 100%.
+   */
+  private reportProgress(force = false): void {
+    const now = Date.now();
+    if (
+      !force &&
+      this.totalSize > 0 &&
+      this.received < this.totalSize &&
+      now - this.lastProgressAt < PROGRESS_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.lastProgressAt = now;
+    this.options.onProgress?.(this.received, this.totalSize);
+  }
+
   private async finalise(): Promise<void> {
     const sink = this.sinkPromise ? await this.sinkPromise : null;
     if (!sink) return;
 
-    const [blob, actual] = await Promise.all([sink.finish(), sink.digest()]);
-    const expected = this.options.expectedChecksum;
-    const ok = expected ? actual === expected : true;
-    this.options.onVerified?.(ok, actual, expected);
-
-    if (!ok) {
-      this.options.onError?.(
-        "The received file failed its integrity check and was not saved.",
-      );
-      this.options.onStatus?.("failed");
-      await sink.dispose();
-      return;
-    }
-
+    // Nothing is re-read here. Every chunk was checked against the digest it
+    // arrived with before it was stored, so completion already means the whole
+    // file is present and every piece of it matched.
+    const blob = await sink.finish();
     this.options.onProgress?.(this.totalSize, this.totalSize);
+    this.options.onVerified?.(true);
     this.options.onStatus?.("completed");
     this.options.onComplete?.(blob, this.fileName);
+  }
+
+  /**
+   * A chunk did not match the digest it was sent with.
+   *
+   * The transfer stops rather than retrying: the stream cannot be trusted, and
+   * resuming would only hide that. The offset is named so the failure points at
+   * a specific 64 KiB window rather than at "the file".
+   */
+  private integrityFailure(offset: number): void {
+    if (this._cancelled) return;
+    this._cancelled = true;
+    this.settleInterruption(null);
+    this.options.onVerified?.(false);
+    this.options.onError?.(
+      `A chunk at byte ${offset} did not match its checksum, so the transfer was stopped.`,
+    );
+    this.options.onStatus?.("failed");
   }
 }

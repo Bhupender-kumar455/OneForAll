@@ -6,6 +6,10 @@
  * keep the browser's full candidate — `addIceCandidate` rejects one that has
  * neither `sdpMid` nor `sdpMLineIndex` — and add each candidate exactly once,
  * since `onValue` re-delivers the whole list on every write.
+ *
+ * Candidates are read from the current negotiation round's node only. A resume
+ * builds a new peer connection, and the previous round's candidates name an
+ * SDP it never saw; replaying them would surface a bogus ICE error per resume.
  */
 import { db, onValue, ref } from "../firebase/database.ts";
 import type { Peer } from "./peer.ts";
@@ -15,12 +19,13 @@ import type { StoredCandidate } from "./types.ts";
 export function mirrorRemoteCandidates(
   transferId: string,
   path: "senderCandidates" | "receiverCandidates",
+  round: number,
   peer: Peer,
   onError?: (message: string) => void,
 ): () => void {
   const applied = new Set<string>();
 
-  return onValue(ref(db, `transfers/${transferId}/${path}`), (snap) => {
+  return onValue(ref(db, `transfers/${transferId}/${path}/${round}`), (snap) => {
     const candidates = snap.val() as Record<string, StoredCandidate | null> | null;
     if (!candidates) return;
 
