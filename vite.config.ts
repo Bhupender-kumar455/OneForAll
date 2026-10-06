@@ -5,8 +5,6 @@ import { defineConfig, loadEnv, type Plugin } from 'vite';
 
 import runtimeErrorOverlay from '@replit/vite-plugin-runtime-error-modal';
 
-import executeHandler from './api/execute.ts';
-
 /**
  * The Code Runner's execution endpoint is a Vercel Function (`api/execute.ts`),
  * which production runs and Vite knows nothing about. Without this, the tab's
@@ -16,6 +14,14 @@ import executeHandler from './api/execute.ts';
  * Mounting the same handler keeps one implementation of the validation, limits
  * and provider call across local and deployed, so what runs here is what ships.
  * It answers only on `/api/execute`; Vercel's function takes over in production.
+ */
+const EXECUTE_HANDLER_PATH = './api/execute.ts' as const;
+
+/**
+ * The handler is imported lazily, inside the plugin factory, so the Vite config
+ * file never carries a top-level import of a Vercel Function. A static reference
+ * to `api/execute.ts` at module-evaluation time is what confused Vercel's
+ * build into skipping emission on that file.
  */
 function runnerApi(): Plugin {
   /**
@@ -34,47 +40,64 @@ function runnerApi(): Plugin {
     }
   };
 
-  const mount = (middlewares: {
-    use: (
-      route: string,
-      handler: (req: unknown, res: unknown, next: (error?: unknown) => void) => void,
-    ) => void;
-  }): void => {
-    middlewares.use('/api/execute', (req, raw, _next) => {
-      const res = raw as {
-        setHeader(name: string, value: string): void;
-        statusCode: number;
-        end(body?: string): void;
-      };
-
-      // Connect hands us Node's request and response, not Vercel's. Give the
-      // handler the three methods it uses and let it write straight through;
-      // it reads the body from the stream when nothing has parsed it.
-      const response = {
-        setHeader: (name: string, value: string) => res.setHeader(name, value),
-        status: (code: number) => {
-          res.statusCode = code;
-          return response;
-        },
-        json: (body: unknown) => {
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify(body));
-        },
-      };
-
-      void executeHandler(req as Parameters<typeof executeHandler>[0], response);
-    });
-  };
-
   return {
     name: 'code-runner-api',
     configureServer(server) {
       applyEnv(server.config.mode);
-      mount(server.middlewares);
+      server.middlewares.use('/api/execute', async (req, res, _next) => {
+        // Lazy import so the function is only loaded in a running dev/preview
+        // server, never at config-evaluation time.
+        const { default: executeHandler } = await import(EXECUTE_HANDLER_PATH);
+
+        const nodeRes = res as {
+          setHeader(name: string, value: string): void;
+          statusCode: number;
+          end(body?: string): void;
+        };
+
+        // Connect hands us Node's request and response, not Vercel's. Give the
+        // handler the three methods it uses and let it write straight through;
+        // it reads the body from the stream when nothing has parsed it.
+        const response = {
+          setHeader: (name: string, value: string) => nodeRes.setHeader(name, value),
+          status: (code: number) => {
+            nodeRes.statusCode = code;
+            return response;
+          },
+          json: (body: unknown) => {
+            nodeRes.setHeader('Content-Type', 'application/json');
+            nodeRes.end(JSON.stringify(body));
+          },
+        };
+
+        await executeHandler(req as Parameters<typeof executeHandler>[0], response);
+      });
     },
     configurePreviewServer(server) {
       applyEnv(server.config.mode);
-      mount(server.middlewares);
+      server.middlewares.use('/api/execute', async (req, res, _next) => {
+        const { default: executeHandler } = await import(EXECUTE_HANDLER_PATH);
+
+        const nodeRes = res as {
+          setHeader(name: string, value: string): void;
+          statusCode: number;
+          end(body?: string): void;
+        };
+
+        const response = {
+          setHeader: (name: string, value: string) => nodeRes.setHeader(name, value),
+          status: (code: number) => {
+            nodeRes.statusCode = code;
+            return response;
+          },
+          json: (body: unknown) => {
+            nodeRes.setHeader('Content-Type', 'application/json');
+            nodeRes.end(JSON.stringify(body));
+          },
+        };
+
+        await executeHandler(req as Parameters<typeof executeHandler>[0], response);
+      });
     },
   };
 }
