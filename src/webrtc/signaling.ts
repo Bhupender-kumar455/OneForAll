@@ -24,6 +24,7 @@
  * UI.  The handshake runs in the background and reports through the handlers.
  */
 import { waitForAuthUser } from "../firebase/auth";
+import { withTimeout } from "../lib/promise-timeout";
 import {
   addReceiverCandidate,
   addSenderCandidate,
@@ -77,6 +78,29 @@ const RESUME_TIMEOUT_MS = 30_000;
 /** How many times the connection is rebuilt before the transfer is failed. */
 const MAX_RESUME_ROUNDS = 3;
 
+/**
+ * How long creating (or joining) a session may take before we call it failed.
+ *
+ * Sign-in and the record write are the two steps that can stall silently: a
+ * socket that never opens, a firewall that drops the Realtime Database, a
+ * domain Firebase will not authorise. None of them reject on their own, so
+ * without this bound the page sits on "waiting" forever with no link and no
+ * error — which is indistinguishable from a working transfer. Twenty seconds is
+ * far longer than these calls need on a healthy connection.
+ */
+const SETUP_TIMEOUT_MS = 20_000;
+
+const SIGN_IN_TIMEOUT_MESSAGE =
+  "Could not sign in to Firebase. Check your connection, and that this site's " +
+  "domain is listed under Authentication → Settings → Authorized domains.";
+
+const CREATE_RECORD_TIMEOUT_MESSAGE =
+  "Could not create the transfer in Firebase. Check your connection, and that " +
+  "the Realtime Database rules allow writing to transfers.";
+
+const LOAD_RECORD_TIMEOUT_MESSAGE =
+  "Could not read the transfer from Firebase. Check your connection to the database.";
+
 /** How many renegotiation windows the receiver waits through per round. */
 const RESUME_OFFER_ATTEMPTS = 2;
 
@@ -94,7 +118,11 @@ export async function startTransfer(
     );
   }
 
-  const owner = await waitForAuthUser();
+  const owner = await withTimeout(
+    waitForAuthUser(),
+    SETUP_TIMEOUT_MS,
+    SIGN_IN_TIMEOUT_MESSAGE,
+  );
   // No read of the file here: the share link appears immediately, and the
   // integrity data is produced per chunk while the transfer runs.
   const transferFile: TransferFile = {
@@ -103,7 +131,11 @@ export async function startTransfer(
     mime: file.type || "application/octet-stream",
   };
 
-  const transferId = await createTransferRecord(owner.uid, transferFile);
+  const transferId = await withTimeout(
+    createTransferRecord(owner.uid, transferFile),
+    SETUP_TIMEOUT_MS,
+    CREATE_RECORD_TIMEOUT_MESSAGE,
+  );
 
   const senderOptions: SenderOptions = {
     onStatus: (status) => handlers.onStatus?.(status as TransferStatus),
@@ -228,8 +260,16 @@ export async function joinTransfer(
     );
   }
 
-  const receiver = await waitForAuthUser();
-  const dto = await loadTransfer(transferId);
+  const receiver = await withTimeout(
+    waitForAuthUser(),
+    SETUP_TIMEOUT_MS,
+    SIGN_IN_TIMEOUT_MESSAGE,
+  );
+  const dto = await withTimeout(
+    loadTransfer(transferId),
+    SETUP_TIMEOUT_MS,
+    LOAD_RECORD_TIMEOUT_MESSAGE,
+  );
   if (!dto) throw new Error("This transfer no longer exists.");
   if (Date.now() > dto.expiresAt) throw new Error("This transfer has expired.");
   if (dto.receiverUid && dto.receiverUid !== receiver.uid) {

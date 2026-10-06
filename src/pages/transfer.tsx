@@ -28,7 +28,12 @@ type Phase =
       kind: "session";
       role: "sender" | "receiver";
       transferId: string | null;
-      status: TransferStatus;
+      /**
+       * `preparing` is page-only: it covers the gap between pressing "Create
+       * transfer link" and the share link existing, during which no device has
+       * been invited yet and "waiting for another device" would be a lie.
+       */
+      status: TransferStatus | "preparing";
       progress: number;
       /** Bytes moved so far, for the "12.4 MB / 2.00 GB" readout. */
       bytes: number;
@@ -50,8 +55,10 @@ function transferIdFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get("t");
 }
 
-function statusLabel(status: TransferStatus): string {
+function statusLabel(status: TransferStatus | "preparing"): string {
   switch (status) {
+    case "preparing":
+      return "Creating the transfer link…";
     case "waiting":
       return "Waiting for the other device…";
     case "connecting":
@@ -152,7 +159,7 @@ export default function TransferPage() {
         kind: "session",
         role: "sender",
         transferId: null,
-        status: "waiting",
+        status: "preparing",
         progress: 0,
         bytes: 0,
         speed: null,
@@ -388,6 +395,14 @@ export default function TransferPage() {
             {phase.file && (
               <p className="mt-2 text-sm text-muted-foreground">
                 {phase.file.name} · {formatBytes(phase.file.size)}
+              </p>
+            )}
+
+            {phase.status === "preparing" && (
+              <p className="mt-4 rounded-lg border border-border bg-muted/40 p-3 text-sm text-muted-foreground">
+                Signing in and creating the record in Firebase. The share link
+                appears below as soon as that succeeds — until then there is
+                nothing to send to the other device.
               </p>
             )}
 
