@@ -8,6 +8,7 @@
  *   - Writes are chained, so a slow-disk sink cannot reorder or drop a chunk.
  */
 import { digestsMatch, sha256Bytes } from "./checksum.ts";
+import { inflateChunk } from "./compress.ts";
 import {
   CHUNK_SIZE,
   decodeChunk,
@@ -15,6 +16,7 @@ import {
   MAX_DECLARED_BYTES,
   missingRanges,
   PROGRESS_INTERVAL_MS,
+  PROTOCOL_VERSION,
   serializeMessage,
 } from "./protocol.ts";
 import { createSink, type TransferSink } from "./sink.ts";
@@ -278,13 +280,23 @@ export class DataReceiver {
   }
 
   private startFile(msg: Extract<ControlMessage, { type: "file-start" }>): void {
+    // Checked before anything else, because a mismatched pair fails on the very
+    // first chunk and the checksum error it produces says nothing about why.
+    // The flag byte in the chunk header is what makes the two versions
+    // incompatible, so this is the only place the disagreement can be named.
+    if (msg.protocol !== PROTOCOL_VERSION) {
+      this.fail(
+        "This transfer was started by a different version of the app. Reload both pages and try again.",
+      );
+      return;
+    }
+
     // An absolute sanity bound only. The real ceiling is the sink's: a disk
     // sink streams and is limited by the disk, a memory sink buffers and is
     // limited by RAM. Checking the sink's limit here would reject a large file
     // on the very browsers that could have streamed it.
     if (!Number.isFinite(msg.size) || msg.size <= 0 || msg.size > MAX_DECLARED_BYTES) {
-      this.options.onError?.(`Refusing an invalid file size (${msg.size} bytes)`);
-      this.options.onStatus?.("failed");
+      this.fail(`Refusing an invalid file size (${msg.size} bytes)`);
       return;
     }
 
@@ -305,8 +317,7 @@ export class DataReceiver {
       (err: unknown) => {
         this._cancelled = true;
         this.settleInterruption(null);
-        this.options.onError?.(err instanceof Error ? err.message : String(err));
-        this.options.onStatus?.("failed");
+        this.fail(err instanceof Error ? err.message : String(err));
         return null;
       },
     );
@@ -317,45 +328,67 @@ export class DataReceiver {
   private handleChunk(frame: ArrayBuffer): void {
     let offset: number;
     let digest: Uint8Array;
-    let data: Uint8Array;
+    let data: Uint8Array<ArrayBuffer>;
+    let deflated: boolean;
     try {
-      ({ offset, digest, data } = decodeChunk(frame));
+      ({ offset, digest, data, deflated } = decodeChunk(frame));
     } catch {
       this.options.onError?.("Malformed chunk frame from sender");
       return;
     }
 
-    // Started here rather than inside the chain below so the hash of this
-    // chunk overlaps the queued writes of the ones before it.
-    const actual = sha256Bytes(data);
+    // How much of the file this chunk claims to fill. The expansion below is
+    // capped by it, so a payload that tries to decode into something larger is
+    // stopped before it is held in memory.
+    const expected = Math.min(CHUNK_SIZE, this.totalSize - offset);
+
+    // Expansion and hashing both start here rather than inside the chain below,
+    // so they overlap the queued writes of the chunks before this one. The
+    // digest describes the bytes as they exist in the file, which for a
+    // compressed chunk only exist after expanding it.
+    const settled = (
+      deflated
+        ? expected > 0
+          ? inflateChunk(data, expected)
+          : Promise.reject(new Error("Compressed chunk lies outside the file"))
+        : Promise.resolve(data)
+    )
+      .then(async (bytes) => ({ bytes, ok: digestsMatch(digest, await sha256Bytes(bytes)) }))
+      // An undecodable payload is reported as the integrity failure it is, at
+      // the offset it claimed, rather than as a writing problem.
+      .catch(() => null);
 
     // Chain the write: a sink that resolves asynchronously must not interleave.
     this.writes = this.writes
       .then(async () => {
         if (this._cancelled) return;
+        const result = await settled;
         // Checked before storing, so a corrupt chunk is never written to the
         // file and never counted as present — which would otherwise be a silent
         // hole that the completeness check happily accepts.
-        if (!digestsMatch(digest, await actual)) {
+        if (result === null || !result.ok) {
           this.integrityFailure(offset);
           return;
         }
         const sink = this.sinkPromise ? await this.sinkPromise : null;
         if (!sink || this._cancelled) return;
-        await sink.write(offset, data);
+        await sink.write(offset, result.bytes);
 
         if (!this.seen.has(offset)) {
           this.seen.add(offset);
-          this.received += data.byteLength;
+          this.received += result.bytes.byteLength;
           this.reportProgress();
         }
         this.completeIfDone();
       })
       .catch((err: unknown) => {
-        this.options.onError?.(
+        // A sink that refuses a chunk will refuse the rest, so the transfer is
+        // over: stopping frees the sender from writing gigabytes nobody keeps.
+        this._cancelled = true;
+        this.settleInterruption(null);
+        this.fail(
           `Could not store a chunk: ${err instanceof Error ? err.message : String(err)}`,
         );
-        this.options.onStatus?.("failed");
       });
   }
 
@@ -369,10 +402,7 @@ export class DataReceiver {
     const allSeen = this.totalChunks > 0 && this.seen.size >= this.totalChunks;
     if (!allSeen) {
       if (forced) {
-        this.options.onError?.(
-          `Transfer ended with ${this.totalChunks - this.seen.size} chunk(s) missing`,
-        );
-        this.options.onStatus?.("failed");
+        this.fail(`Transfer ended with ${this.totalChunks - this.seen.size} chunk(s) missing`);
       }
       return;
     }
@@ -382,10 +412,9 @@ export class DataReceiver {
     // Surface a finalise failure rather than hanging: a swallowed error here
     // would leave the transfer stuck with no explanation.
     this.writes = this.writes.then(() => this.finalise()).catch((err: unknown) => {
-      this.options.onError?.(
+      this.fail(
         `Could not finish the transfer: ${err instanceof Error ? err.message : String(err)}`,
       );
-      this.options.onStatus?.("failed");
     });
   }
 
@@ -436,9 +465,26 @@ export class DataReceiver {
     this._cancelled = true;
     this.settleInterruption(null);
     this.options.onVerified?.(false);
-    this.options.onError?.(
+    this.fail(
       `A chunk at byte ${offset} did not match its checksum, so the transfer was stopped.`,
     );
+  }
+
+  /**
+   * Report a failure to the user *and* to the other device.
+   *
+   * The sender is the side that decides whether the transfer "succeeded": it
+   * can hand every byte to the channel and announce delivery while this side is
+   * refusing the file or discarding it. Without this frame it does exactly that,
+   * and keeps streaming gigabytes at a receiver that is dropping them.
+   */
+  private fail(message: string): void {
+    try {
+      this.channel.send(serializeMessage({ type: "error", message }));
+    } catch {
+      // The channel is already gone; the local report still stands.
+    }
+    this.options.onError?.(message);
     this.options.onStatus?.("failed");
   }
 }

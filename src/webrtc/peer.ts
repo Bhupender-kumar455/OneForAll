@@ -51,7 +51,7 @@ export class Peer {
     // Receiver side: the sender's channel arrives via this event.
     this._pc.ondatachannel = (event: RTCDataChannelEvent) => {
       this._dataChannel = event.channel;
-      this.installChannelLogging(event.channel);
+      this.prepareChannel(event.channel);
       // Hand the channel over synchronously: the sender only starts once the
       // channel is open, and waiting a poll interval would risk dropping the
       // first frames if the receiver attached its handler too late.
@@ -83,7 +83,7 @@ export class Peer {
     if (!this._dataChannel) {
       const channel = this._pc.createDataChannel("file", { ordered: true });
       this._dataChannel = channel;
-      this.installChannelLogging(channel);
+      this.prepareChannel(channel);
     }
     return this._dataChannel;
   }
@@ -172,7 +172,8 @@ export class Peer {
     });
   }
 
-  private installChannelLogging(channel: RTCDataChannel): void {
+  /** Chunks arrive as binary frames; text frames carry the control messages. */
+  private prepareChannel(channel: RTCDataChannel): void {
     channel.binaryType = "arraybuffer";
   }
 }

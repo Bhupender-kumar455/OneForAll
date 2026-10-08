@@ -69,6 +69,43 @@ describe("memory sink", () => {
   });
 });
 
+/**
+ * Pretend this browser has OPFS, but that opening the scratch file fails — the
+ * shape of a full quota or a private window. The refusal then has to say why,
+ * because "cannot stream to disk" on its own is not something a user can act on.
+ */
+describe("createSink (disk path refuses)", () => {
+  it("keeps the reason the scratch file could not be opened", async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        storage: {
+          getDirectory: () => Promise.reject(new Error("QuotaExceededError")),
+        },
+      },
+    });
+
+    try {
+      assert.equal(canStreamToDisk(), true);
+      await assert.rejects(
+        () => createSink("quota", MAX_TRANSFER_BYTES + 1),
+        (err: Error) => {
+          assert.match(err.message, /cannot stream to disk/i);
+          assert.match(err.message, /QuotaExceededError/);
+          return true;
+        },
+      );
+      // A file that fits in memory still falls back rather than failing.
+      const sink = await createSink("quota-small", 128);
+      assert.equal(sink.kind, "memory");
+      await sink.dispose();
+    } finally {
+      if (original) Object.defineProperty(globalThis, "navigator", original);
+    }
+  });
+});
+
 describe("transfer size guard", () => {
   it("keeps the memory-sink ceiling at one gigabyte", () => {
     assert.equal(MAX_TRANSFER_BYTES, 1_000_000_000);

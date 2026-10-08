@@ -31,6 +31,7 @@ import {
   createTransferRecord,
   deleteTransfer,
   isConfigured,
+  isTransferExpired,
   loadTransfer,
   onValue,
   ref,
@@ -221,6 +222,13 @@ export async function startTransfer(
           void writeTransferStatus(transferId, "cancelled").catch(() => {});
           return;
         }
+        if (attempt.failed) {
+          // The receiver could not store the file. Renegotiating would repeat
+          // the same refusal, so the session ends here rather than spinning
+          // through resume rounds that cannot succeed.
+          void writeTransferStatus(transferId, "failed").catch(() => {});
+          return;
+        }
         if (attempt.completed) {
           // Reach a terminal state so the record does not look in-flight forever.
           void writeTransferStatus(transferId, "completed").catch(() => {});
@@ -234,10 +242,12 @@ export async function startTransfer(
 
       handlers.onError?.("The connection kept dropping, so the file was not fully delivered.");
       handlers.onStatus?.("failed");
+      void writeTransferStatus(transferId, "failed").catch(() => {});
     } catch (err: unknown) {
       if (cancelled) return;
       handlers.onError?.(err instanceof Error ? err.message : String(err));
       handlers.onStatus?.("failed");
+      void writeTransferStatus(transferId, "failed").catch(() => {});
     }
   })();
 
@@ -271,7 +281,9 @@ export async function joinTransfer(
     LOAD_RECORD_TIMEOUT_MESSAGE,
   );
   if (!dto) throw new Error("This transfer no longer exists.");
-  if (Date.now() > dto.expiresAt) throw new Error("This transfer has expired.");
+  // One rule for expiry, in the module that owns the record: this used to
+  // re-implement the comparison, so the two could drift apart.
+  if (isTransferExpired(dto)) throw new Error("This transfer has expired.");
   if (dto.receiverUid && dto.receiverUid !== receiver.uid) {
     throw new Error("Another receiver already claimed this transfer.");
   }
@@ -439,11 +451,22 @@ function buildPeer(
 
 // ── Firebase waiters ────────────────────────────────────────────────────
 
-/** Poll for a value that the other browser may not have written yet. */
-function waitForValue(
+/**
+ * Wait for a description the other browser may not have written yet, giving up
+ * after `timeoutMs` (or as soon as `isCancelled` says the session is over).
+ *
+ * `accept` is the only thing the two waits below disagree about.  It exists
+ * because resume reuses the same `offer`/`answer` nodes: when the new round
+ * begins, the *previous* round's description is still stored, and treating that
+ * stale value as the new one would apply a description the fresh peer
+ * connection never saw.  Everything else — the subscription, the timeout and
+ * the cancel poll — is identical, so it lives here once.
+ */
+function waitForStoredValue(
   transferId: TransferId,
   path: "offer" | "answer",
   timeoutMs: number,
+  accept: (value: string) => boolean,
   isCancelled?: () => boolean,
 ): Promise<string | null> {
   return new Promise((resolve) => {
@@ -463,7 +486,7 @@ function waitForValue(
 
     const unsubscribe = onValue(ref(db, `transfers/${transferId}/${path}`), (snap) => {
       const value = snap.val() as string | null;
-      if (typeof value === "string" && value.length > 0) finish(value);
+      if (typeof value === "string" && value.length > 0 && accept(value)) finish(value);
     });
 
     const timer = setTimeout(() => finish(null), timeoutMs);
@@ -477,14 +500,17 @@ function waitForValue(
   });
 }
 
-/**
- * Wait for a *different* value than the one already known.
- *
- * Resume reuses the same `offer`/`answer` nodes, so the previous round's
- * description is still there when the new round begins.  Treating that stale
- * value as the new one would apply a description the fresh peer connection
- * never saw.
- */
+/** The first description of this kind that appears. */
+function waitForValue(
+  transferId: TransferId,
+  path: "offer" | "answer",
+  timeoutMs: number,
+  isCancelled?: () => boolean,
+): Promise<string | null> {
+  return waitForStoredValue(transferId, path, timeoutMs, () => true, isCancelled);
+}
+
+/** The first description that differs from the one already known. */
 function waitForValueChange(
   transferId: TransferId,
   path: "offer" | "answer",
@@ -492,32 +518,13 @@ function waitForValueChange(
   timeoutMs: number,
   isCancelled?: () => boolean,
 ): Promise<string | null> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let poll: ReturnType<typeof setInterval> | undefined;
-
-    const finish = (value: string | null): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (poll) clearInterval(poll);
-      unsubscribe();
-      resolve(value);
-    };
-
-    const unsubscribe = onValue(ref(db, `transfers/${transferId}/${path}`), (snap) => {
-      const value = snap.val() as string | null;
-      if (typeof value === "string" && value.length > 0 && value !== previous) finish(value);
-    });
-
-    const timer = setTimeout(() => finish(null), timeoutMs);
-
-    if (isCancelled) {
-      poll = setInterval(() => {
-        if (isCancelled()) finish(null);
-      }, 500);
-    }
-  });
+  return waitForStoredValue(
+    transferId,
+    path,
+    timeoutMs,
+    (value) => value !== previous,
+    isCancelled,
+  );
 }
 
 function waitForAnswer(

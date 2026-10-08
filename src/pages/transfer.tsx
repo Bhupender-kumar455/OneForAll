@@ -457,7 +457,11 @@ export default function TransferPage() {
                   ? phase.verified === true
                     ? "Every chunk matched the digest it was sent with, so the file was reconstructed and downloaded."
                     : "The file was reconstructed and downloaded."
-                  : "The file was delivered."}
+                  : // Deliberately not "delivered": this side can only see that every
+                    // byte went out and the other device raised no objection. The
+                    // receiver reports a failure it hit, so silence is the closest
+                    // thing to confirmation the sender can honestly claim.
+                    "Every chunk was sent, and the other device reported no problem storing it."}
               </p>
             )}
 

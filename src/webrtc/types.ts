@@ -85,7 +85,15 @@ export interface TransferChannel {
  * `protocol.ts`), so a chunk never round-trips through JSON.
  */
 export type ControlMessage =
-  | { type: "file-start"; name: string; size: number; mime: string; chunkSize: number }
+  | {
+      type: "file-start";
+      /** See `PROTOCOL_VERSION`: the two browsers must agree on the frame shape. */
+      protocol: number;
+      name: string;
+      size: number;
+      mime: string;
+      chunkSize: number;
+    }
   | { type: "file-complete" }
   // Resume round: the receiver reports exactly which byte ranges it still
   // needs, the sender announces that it is re-sending only those, and the

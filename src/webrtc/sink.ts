@@ -203,19 +203,26 @@ export async function createSink(
   entryName: string,
   totalSize: number,
 ): Promise<TransferSink> {
+  // Why the disk path could not be set up: private mode, quota, unsupported.
+  let diskFailure: string | null = null;
   if (canStreamToDisk()) {
     try {
       return await DiskSink.create(`${ENTRY_PREFIX}${entryName}`, totalSize);
-    } catch {
-      // Private mode, quota, or unsupported: the memory sink still works.
+    } catch (err: unknown) {
+      // Falling back to memory is right — the memory sink still works — but the
+      // reason is kept, because the refusal below is the only message a user
+      // sees when the file is too large for RAM and it does not otherwise say
+      // what to fix.
+      diskFailure = err instanceof Error ? err.message : String(err);
     }
   }
   // Refuse before allocating. Handing a multi-gigabyte size to `new
   // Uint8Array()` would either throw or take the tab down with it.
   if (totalSize > MAX_TRANSFER_BYTES) {
     throw new Error(
-      `This browser cannot stream to disk, so a ${describeSize(totalSize)} file ` +
-        `would have to be held in memory; the limit is ${describeSize(MAX_TRANSFER_BYTES)}.`,
+      `This browser cannot stream to disk${diskFailure ? ` (${diskFailure})` : ""}, ` +
+        `so a ${describeSize(totalSize)} file would have to be held in memory; ` +
+        `the limit is ${describeSize(MAX_TRANSFER_BYTES)}.`,
     );
   }
   return new MemorySink(totalSize);

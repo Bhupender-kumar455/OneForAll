@@ -47,6 +47,21 @@ export const READ_AHEAD_CHUNKS = 8;
 export const CHUNK_OFFSET_BYTES = 8;
 
 /**
+ * Protocol version, announced in `file-start`.
+ *
+ * The chunk header grew a flag byte when per-chunk compression arrived, so a
+ * mismatch between the two browsers would otherwise surface as a checksum error
+ * on the first chunk — a confusing way to learn that one tab is running an older
+ * build than the other.
+ */
+export const PROTOCOL_VERSION = 2;
+
+/** One byte saying whether a chunk's payload is deflated or the raw bytes. */
+export const CHUNK_FLAG_BYTES = 1;
+export const CHUNK_FLAG_RAW = 0;
+export const CHUNK_FLAG_DEFLATE = 1;
+
+/**
  * SHA-256 of the chunk payload, carried in the frame itself.
  *
  * Truncating this would save 24 bytes per 64 KiB chunk, which is 0.04% of the
@@ -56,8 +71,27 @@ export const CHUNK_OFFSET_BYTES = 8;
  */
 export const CHUNK_DIGEST_BYTES = 32;
 
-/** Byte length of the offset-plus-digest header on every binary chunk frame. */
-export const CHUNK_HEADER_BYTES = CHUNK_OFFSET_BYTES + CHUNK_DIGEST_BYTES;
+/** Byte length of the offset, flag and digest header on every binary chunk frame. */
+export const CHUNK_HEADER_BYTES =
+  CHUNK_OFFSET_BYTES + CHUNK_FLAG_BYTES + CHUNK_DIGEST_BYTES;
+
+/**
+ * How much of a file is compressed before the sender stops asking.
+ *
+ * Whether deflate helps is a property of the payload, and the only way to know
+ * is to try — but trying is not free: deflate runs at roughly 40 MiB/s against
+ * the ~750 MiB/s of the per-chunk SHA-256 already in this pipeline, so a file
+ * that will not compress must not pay that cost for gigabytes. Eight chunks is
+ * enough to tell a text file from a zip, and it is 0.04% of a 1.3 GB file.
+ */
+export const COMPRESSION_PROBE_BYTES = 512 * 1024;
+
+/**
+ * Compression keeps going only while the packed size stays under this fraction
+ * of the original. Below it, compression is clearly earning its CPU; above it,
+ * the bytes saved are not worth the latency it adds.
+ */
+export const COMPRESSION_WORTH_IT_RATIO = 0.95;
 
 /**
  * How long the sender waits for the receiver's list of missing ranges before
@@ -141,35 +175,50 @@ export function deserializeMessage(json: string): ControlMessage {
  */
 export function encodeChunk(
   offset: number,
-  data: ArrayBuffer,
+  data: ArrayBuffer | Uint8Array,
   digest: Uint8Array,
+  deflated = false,
 ): ArrayBuffer {
   if (digest.byteLength !== CHUNK_DIGEST_BYTES) {
     throw new Error(
       `Chunk digest must be ${CHUNK_DIGEST_BYTES} bytes, got ${digest.byteLength}`,
     );
   }
-  const frame = new Uint8Array(CHUNK_HEADER_BYTES + data.byteLength);
+  const payload = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const frame = new Uint8Array(CHUNK_HEADER_BYTES + payload.byteLength);
   new DataView(frame.buffer).setFloat64(0, offset, false);
-  frame.set(digest, CHUNK_OFFSET_BYTES);
-  frame.set(new Uint8Array(data), CHUNK_HEADER_BYTES);
+  frame[CHUNK_OFFSET_BYTES] = deflated ? CHUNK_FLAG_DEFLATE : CHUNK_FLAG_RAW;
+  frame.set(digest, CHUNK_OFFSET_BYTES + CHUNK_FLAG_BYTES);
+  frame.set(payload, CHUNK_HEADER_BYTES);
   return frame.buffer;
 }
 
 /**
- * Inverse of `encodeChunk`; returns the offset, the claimed digest and the
- * chunk's bytes. The digest is a view into the frame, so it costs no copy.
+ * Inverse of `encodeChunk`; returns the offset, the claimed digest, the chunk's
+ * bytes and whether those bytes still need expanding. The digest is a view into
+ * the frame, so it costs no copy.
  */
 export function decodeChunk(frame: ArrayBuffer): {
   offset: number;
   digest: Uint8Array;
-  data: Uint8Array;
+  data: Uint8Array<ArrayBuffer>;
+  deflated: boolean;
 } {
   if (frame.byteLength < CHUNK_HEADER_BYTES) {
     throw new Error("Chunk frame is missing its offset header");
   }
   const offset = new DataView(frame).getFloat64(0, false);
-  const digest = new Uint8Array(frame, CHUNK_OFFSET_BYTES, CHUNK_DIGEST_BYTES);
-  return { offset, digest, data: new Uint8Array(frame, CHUNK_HEADER_BYTES) };
+  const flag = new Uint8Array(frame, CHUNK_OFFSET_BYTES, CHUNK_FLAG_BYTES)[0];
+  const digest = new Uint8Array(
+    frame,
+    CHUNK_OFFSET_BYTES + CHUNK_FLAG_BYTES,
+    CHUNK_DIGEST_BYTES,
+  );
+  return {
+    offset,
+    digest,
+    data: new Uint8Array(frame, CHUNK_HEADER_BYTES),
+    deflated: flag === CHUNK_FLAG_DEFLATE,
+  };
 }
 

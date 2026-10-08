@@ -10,6 +10,7 @@ import {
   deserializeMessage,
   encodeChunk,
   missingRanges,
+  PROTOCOL_VERSION,
   serializeMessage,
   totalBytes,
 } from "./protocol.ts";
@@ -137,6 +138,7 @@ describe("control messages", () => {
   it("round-trips a file-start message", () => {
     const msg = {
       type: "file-start" as const,
+      protocol: PROTOCOL_VERSION,
       name: "report.pdf",
       size: 4096,
       mime: "application/pdf",

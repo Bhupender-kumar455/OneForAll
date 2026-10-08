@@ -4,11 +4,14 @@ import { describe, it } from "node:test";
 import { DataReceiver } from "./receiver.ts";
 import { DataSender } from "./sender.ts";
 import { sha256Bytes } from "./checksum.ts";
+import { deflateChunk } from "./compress.ts";
 import {
+  BACKPRESSURE_THRESHOLD,
   CHUNK_HEADER_BYTES,
   CHUNK_SIZE,
   encodeChunk,
   MAX_DECLARED_BYTES,
+  PROTOCOL_VERSION,
   READ_AHEAD_CHUNKS,
   totalBytes,
 } from "./protocol.ts";
@@ -64,6 +67,44 @@ function makeChannelPair(): [TransferChannel, TransferChannel] {
 
 function makeFile(name: string, bytes: Uint8Array, type = "application/octet-stream"): File {
   return new File([bytes], name, { type });
+}
+
+/** Text-like bytes: the case compression exists for. */
+function textBytes(size: number): Uint8Array {
+  const line = "2026-10-08T00:00:00Z INFO worker finished batch in 421ms\n";
+  const out = new Uint8Array(size);
+  for (let i = 0; i < size; i += 1) out[i] = line.charCodeAt(i % line.length);
+  return out;
+}
+
+/** Already-compressed bytes: the case compression cannot help. */
+function randomBytes(size: number): Uint8Array {
+  const out = new Uint8Array(size);
+  // `getRandomValues` refuses more than 64 KiB in one call, so fill in steps.
+  for (let at = 0; at < size; at += 65536) {
+    crypto.getRandomValues(out.subarray(at, Math.min(at + 65536, size)));
+  }
+  return out;
+}
+
+/**
+ * A channel pair whose sender side is above the backpressure threshold until
+ * `release()` is called, which is what a real DataChannel looks like under load.
+ *
+ * The stall is what makes a control frame from the peer observable at all:
+ * without it the send loop drains the whole file through microtasks and never
+ * yields to the channel's own timer, so a refusal that arrives in one tick would
+ * only ever be read after the file had already been sent.
+ */
+function makeStalledChannelPair(): {
+  out: TransferChannel;
+  back: TransferChannel;
+  release: () => void;
+} {
+  const [out, back] = makeChannelPair();
+  let buffered = BACKPRESSURE_THRESHOLD * 2;
+  Object.defineProperty(out, "bufferedAmount", { get: () => buffered });
+  return { out, back, release: () => { buffered = 0; } };
 }
 
 /**
@@ -196,6 +237,7 @@ describe("DataSender -> DataReceiver", () => {
     // memory sink is chosen and it must refuse before allocating 2 GB.
     out.send(JSON.stringify({
       type: "file-start",
+      protocol: PROTOCOL_VERSION,
       name: "huge.bin",
       size: 2 * 1024 * 1024 * 1024,
       mime: "application/octet-stream",
@@ -211,6 +253,7 @@ describe("DataSender -> DataReceiver", () => {
     new DataReceiver("absurd", back, { onError: (e) => errors.push(e) });
     out.send(JSON.stringify({
       type: "file-start",
+      protocol: PROTOCOL_VERSION,
       name: "absurd.bin",
       size: MAX_DECLARED_BYTES + 1,
       mime: "application/octet-stream",
@@ -257,6 +300,7 @@ describe("DataSender -> DataReceiver", () => {
     };
     deliver(JSON.stringify({
       type: "file-start",
+      protocol: PROTOCOL_VERSION,
       name: "coalesce.bin",
       size,
       mime: "application/octet-stream",
@@ -331,6 +375,7 @@ describe("DataSender -> DataReceiver", () => {
     };
     deliver(JSON.stringify({
       type: "file-start",
+      protocol: PROTOCOL_VERSION,
       name: "resume.bin",
       size,
       mime: "application/octet-stream",
@@ -380,11 +425,14 @@ describe("DataSender -> DataReceiver", () => {
 
     // Four chunk frames — the four missing ones — not the whole file.
     assert.equal(frames.length, 4);
-    // Payload plus one offset/digest header per re-sent chunk.
+    // Payload plus one offset/flag/digest header per re-sent chunk. The payload
+    // total is read off the sender rather than recomputed from `missingBytes`,
+    // so this stays exact whether or not those chunks were compressed.
     assert.equal(
       frames.reduce((sum, length) => sum + length, 0),
-      missingBytes + 4 * CHUNK_HEADER_BYTES,
+      sender.wireBytes + 4 * CHUNK_HEADER_BYTES,
     );
+    assert.ok(sender.wireBytes <= missingBytes);
   });
 
   it("ignores a close from a channel it has already moved past", async () => {
@@ -396,6 +444,7 @@ describe("DataSender -> DataReceiver", () => {
     back1.onmessage?.(new MessageEvent("message", {
       data: JSON.stringify({
         type: "file-start",
+        protocol: PROTOCOL_VERSION,
         name: "stale.bin",
         size,
         mime: "application/octet-stream",
@@ -435,6 +484,7 @@ describe("DataSender -> DataReceiver", () => {
     };
     deliver(JSON.stringify({
       type: "file-start",
+      protocol: PROTOCOL_VERSION,
       name: "tail.bin",
       size,
       mime: "application/octet-stream",
@@ -483,6 +533,7 @@ describe("DataSender -> DataReceiver", () => {
     back.onmessage?.(new MessageEvent("message", {
       data: JSON.stringify({
         type: "file-start",
+        protocol: PROTOCOL_VERSION,
         name: "corrupt.bin",
         size,
         mime: "application/octet-stream",
@@ -526,5 +577,187 @@ describe("DataSender -> DataReceiver", () => {
     assert.ok(sender.isCancelled);
     assert.ok(receiver.cancelled);
     assert.ok(receiver.bytesReceived < file.size);
+  });
+
+  it("tells the sender when the receiver cannot store the file", async () => {
+    // The bug this covers: the receiver refuses the file, discards everything,
+    // and the sender still announces "delivered" after streaming the lot.
+    const refusal = "This browser cannot stream to disk; the limit is 953.7 MB.";
+    const { out, back, release } = makeStalledChannelPair();
+
+    const receiverErrors: string[] = [];
+    const receiver = new DataReceiver("refuse", back, {
+      onError: (e) => {
+        receiverErrors.push(e);
+        // The peer has refused; let the stalled sender see its own frame.
+        release();
+      },
+      sinkFactory: () => Promise.reject(new Error(refusal)),
+    });
+
+    const size = CHUNK_SIZE * 64;
+    const senderErrors: string[] = [];
+    const statuses: string[] = [];
+    let completions = 0;
+    const sender = new DataSender("refuse", out, makeFile("huge.bin", new Uint8Array(size)), {
+      onError: (e) => senderErrors.push(e),
+      onStatus: (status) => statuses.push(status),
+      onComplete: () => { completions += 1; },
+    });
+
+    await sender.sendFile();
+
+    assert.deepEqual(receiverErrors, [refusal]);
+    assert.deepEqual(senderErrors, [refusal]);
+    // The refusal is reported instead of a bogus success...
+    assert.equal(completions, 0);
+    assert.ok(!sender.completed);
+    assert.ok(sender.failed);
+    assert.ok(statuses.includes("failed"));
+    assert.ok(!statuses.includes("completed"));
+    // ...and the sender stops pushing bytes nobody is keeping.
+    assert.ok(
+      sender.bytesSent < size,
+      `kept sending after the refusal: ${sender.bytesSent} of ${size}`,
+    );
+    assert.equal(receiver.bytesReceived, 0);
+  });
+
+  it("treats a receiver's cancel as a cancel, not a dropped connection", async () => {
+    const { out, back, release } = makeStalledChannelPair();
+    const file = makeFile("cancel-r.bin", new Uint8Array(CHUNK_SIZE * 64));
+
+    let interruptions = 0;
+    const cancelledWith: string[] = [];
+    const sender = new DataSender("cancel-r", out, file, {
+      onInterrupted: () => { interruptions += 1; },
+      onCancelled: (reason) => cancelledWith.push(reason),
+    });
+
+    const sending = sender.sendFile();
+    const receiver = new DataReceiver("cancel-r", back, {});
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    receiver.cancel("The other person stopped it");
+    release();
+    await sending;
+
+    assert.ok(sender.isCancelled);
+    assert.ok(!sender.completed);
+    assert.deepEqual(cancelledWith, ["The other person stopped it"]);
+    // A cancel used to look like a drop, which sent the sender into three
+    // thirty-second resume rounds before giving up.
+    assert.equal(interruptions, 0);
+  });
+
+  it("compresses a text file on the wire and still delivers it byte-for-byte", async () => {
+    const [out, back] = makeChannelPair();
+    const size = CHUNK_SIZE * 12;
+    const source = textBytes(size);
+
+    let blob: Blob | null = null;
+    new DataReceiver("text", back, { onComplete: (b) => { blob = b; } });
+
+    const sender = new DataSender("text", out, makeFile("server.log", source), {});
+    await sender.sendFile();
+
+    const finished = await waitFor(() => blob);
+    assert.deepEqual(
+      Array.from(new Uint8Array(await finished.arrayBuffer())),
+      Array.from(source),
+    );
+    assert.ok(sender.usedCompression, "a text file should have been compressed");
+    assert.ok(
+      sender.wireBytes < sender.bytesSent / 2,
+      `expected a large saving, got ${sender.wireBytes} on the wire for ${sender.bytesSent}`,
+    );
+  });
+
+  it("stops attempting compression once the probe rules the file out", async () => {
+    // Half random, half text — a zip with a log inside. The compressible half
+    // must not be packed once the probe has seen the incompressible one, which
+    // is what stops a ROM or a video paying deflate costs for gigabytes.
+    const [out, back] = makeChannelPair();
+    const prefix = CHUNK_SIZE * 16;
+    const size = CHUNK_SIZE * 28;
+    const source = new Uint8Array(size);
+    source.set(randomBytes(prefix), 0);
+    source.set(textBytes(size - prefix), prefix);
+
+    let blob: Blob | null = null;
+    new DataReceiver("mixed", back, { onComplete: (b) => { blob = b; } });
+
+    const sender = new DataSender("mixed", out, makeFile("mixed.bin", source), {});
+    await sender.sendFile();
+
+    const bytes = new Uint8Array(await (await waitFor(() => blob)).arrayBuffer());
+    assert.equal(bytes.byteLength, size);
+    // Byte-for-byte on both sides of the boundary between the two halves.
+    assert.deepEqual(Array.from(bytes.slice(0, 1024)), Array.from(source.slice(0, 1024)));
+    assert.deepEqual(
+      Array.from(bytes.slice(prefix, prefix + 1024)),
+      Array.from(source.slice(prefix, prefix + 1024)),
+    );
+    // Compressing the whole tail would have saved roughly a third; saving under
+    // a tenth is only possible if the attempt was abandoned.
+    assert.ok(
+      sender.wireBytes > size * 0.9,
+      `compression should have been abandoned, got ${sender.wireBytes} of ${size}`,
+    );
+  });
+
+  it("checks the digest of an expanded chunk, not the compressed bytes", async () => {
+    const [out, back] = makeChannelPair();
+    void out;
+    const errors: string[] = [];
+    new DataReceiver("expand", back, { onError: (e) => errors.push(e) });
+    const deliver = (data: string | ArrayBuffer): void => {
+      back.onmessage?.(new MessageEvent("message", { data }));
+    };
+    deliver(
+      JSON.stringify({
+        type: "file-start",
+        protocol: PROTOCOL_VERSION,
+        name: "expand.bin",
+        size: CHUNK_SIZE,
+        mime: "application/octet-stream",
+        chunkSize: CHUNK_SIZE,
+      }),
+    );
+
+    // The payload is a valid deflate stream, but it did not come from the bytes
+    // at offset 0 — so the digest, which describes the expanded bytes, must fail.
+    const digest = await sha256Bytes(new Uint8Array(CHUNK_SIZE).fill(7).buffer as ArrayBuffer);
+    const packed = await deflateChunk(new Uint8Array(CHUNK_SIZE).fill(9));
+    assert.ok(packed);
+    deliver(encodeChunk(0, packed, digest, true));
+
+    await waitFor(() => (errors.length ? errors : null));
+    assert.match(errors[0], /did not match its checksum/);
+  });
+
+  it("refuses a file started by an incompatible protocol version", async () => {
+    const [out, back] = makeChannelPair();
+    void out;
+    const errors: string[] = [];
+    new DataReceiver("version", back, { onError: (e) => errors.push(e) });
+
+    // What an older build's sender would announce. The chunk header grew a flag
+    // byte, so without this check the mismatch would appear as a checksum error
+    // on the first chunk instead of as a version disagreement.
+    back.onmessage?.(
+      new MessageEvent("message", {
+        data: JSON.stringify({
+          type: "file-start",
+          protocol: PROTOCOL_VERSION - 1,
+          name: "old.bin",
+          size: CHUNK_SIZE,
+          mime: "application/octet-stream",
+          chunkSize: CHUNK_SIZE,
+        }),
+      }),
+    );
+
+    await waitFor(() => (errors.length ? errors : null));
+    assert.match(errors[0], /different version of the app/i);
   });
 });
