@@ -174,3 +174,73 @@ describe('line diff', () => {
     }
   });
 });
+
+describe('line diff options', () => {
+  it('compares exactly when no options are given', () => {
+    assert.equal(diffLines('Alpha', 'alpha').identical, false);
+    assert.equal(diffLines('a  b', 'a b').identical, false);
+  });
+
+  it('treats case-only differences as identical when asked', () => {
+    assert.equal(diffLines('Alpha', 'alpha', { ignoreCase: true }).identical, true);
+  });
+
+  it('still reports real changes under ignoreCase', () => {
+    const result = diffLines('Alpha\nBeta', 'alpha\nGamma', { ignoreCase: true });
+
+    assert.deepEqual(shape(result.rows), ['equal:1:1', 'changed:2:2']);
+    assert.equal(result.unchanged, 1);
+    assert.equal(result.changed, 1);
+  });
+
+  it('collapses repeated and surrounding whitespace under ignoreWhitespace', () => {
+    assert.equal(diffLines('  a   b ', 'a b', { ignoreWhitespace: true }).identical, true);
+    assert.equal(diffLines('if  (x)  {', 'if (x) {', { ignoreWhitespace: true }).identical, true);
+    // A whitespace-only line is the same line as an empty one.
+    assert.equal(diffLines('a\n   \nb', 'a\n\nb', { ignoreWhitespace: true }).identical, true);
+  });
+
+  it('does not treat whitespace that separates tokens as insignificant', () => {
+    assert.equal(diffLines('a b', 'ab', { ignoreWhitespace: true }).identical, false);
+    assert.equal(diffLines('if(x){', 'if (x) {', { ignoreWhitespace: true }).identical, false);
+  });
+
+  it('shows the original text on both sides of a relaxed match', () => {
+    const result = diffLines('  const a = 1;', 'CONST  A  =  1;', {
+      ignoreWhitespace: true,
+      ignoreCase: true,
+    });
+
+    assert.equal(result.identical, true);
+    assert.equal(result.rows.length, 1);
+    assert.equal(result.rows[0].left, '  const a = 1;');
+    assert.equal(result.rows[0].right, 'CONST  A  =  1;');
+  });
+
+  it('stays faithful under the options across randomised inputs', () => {
+    const random = rng(20261010);
+    const alphabet = ['a', 'A', '  x  ', '', 'a  b', 'A b', ' }'];
+    const options = { ignoreWhitespace: true, ignoreCase: true };
+    const key = (value: string) =>
+      toLines(value).map((line) => line.replace(/\s+/g, ' ').trim().toLowerCase());
+
+    for (let trial = 0; trial < 300; trial += 1) {
+      const beforeText = Array.from({ length: Math.floor(random() * 7) }, () => alphabet[Math.floor(random() * alphabet.length)]).join('\n');
+      const afterText = Array.from({ length: Math.floor(random() * 7) }, () => alphabet[Math.floor(random() * alphabet.length)]).join('\n');
+      const label = JSON.stringify([beforeText, afterText]);
+      const result = diffLines(beforeText, afterText, options);
+
+      // Nothing may be lost, duplicated or reordered on either side, even when
+      // the lines that matched did so only approximately.
+      assert.deepEqual(result.rows.filter((r) => r.left !== null).map((r) => r.left), toLines(beforeText), `left rebuilt for ${label}`);
+      assert.deepEqual(result.rows.filter((r) => r.right !== null).map((r) => r.right), toLines(afterText), `right rebuilt for ${label}`);
+
+      // And the verdict must match a plain comparison of the normalised lines.
+      assert.equal(
+        result.identical,
+        key(beforeText).join('\n') === key(afterText).join('\n'),
+        `identical for ${label}`,
+      );
+    }
+  });
+});

@@ -16,12 +16,12 @@ const BRAND_DECORATED = "▂▃▅▇█▓▒░ OneForAll ░▒▓█▇▅�
 /**
  * Top bar shared by every page. It reads and flips the shared theme store (see
  * `@/lib/theme`) and the tab navigation between the formatter, the text
- * extractor, the code runner and the file transfer view.
+ * extractor, the code runner, the diff checker and the file transfer view.
  */
 export function SiteHeader({
   active,
 }: {
-  active: "code" | "extract" | "transfer" | "run";
+  active: "code" | "extract" | "transfer" | "run" | "diff";
 }) {
   const dark = useTheme() === "dark";
 
@@ -36,9 +36,9 @@ export function SiteHeader({
   return (
     <header className="sticky top-0 z-30 border-b border-border bg-background/80 backdrop-blur-md">
       {/*
-        A single row at every width: the brand is the only part allowed to
-        shrink, so the tabs and the theme toggle stay reachable on a phone
-        instead of pushing the row wider than the screen.
+        A single row at every width: the brand truncates and the tab strip
+        scrolls sideways, so the tabs and the theme toggle stay reachable on a
+        phone instead of pushing the row wider than the screen.
       */}
       <div className="flex h-14 items-center justify-between gap-2 px-3 sm:gap-4 sm:px-6 lg:px-10">
         <div className="flex min-w-0 items-center gap-2 sm:gap-3">
@@ -46,7 +46,7 @@ export function SiteHeader({
             <span className="lg:hidden">{BRAND}</span>
             <span className="hidden lg:inline">{BRAND_DECORATED}</span>
           </span>
-          <nav className="flex shrink-0 items-center gap-0.5 sm:ml-3 sm:gap-1">
+          <nav className="editor-scroll flex min-w-0 items-center gap-0.5 overflow-x-auto sm:ml-3 sm:gap-1">
             <Link href="/" className={tabClass(active === "code")}>
               Formatter
             </Link>
@@ -58,6 +58,9 @@ export function SiteHeader({
             </Link>
             <Link href="/run" className={tabClass(active === "run")}>
               Code Runner
+            </Link>
+            <Link href="/diff" className={tabClass(active === "diff")}>
+              Diff
             </Link>
             {active === "code" && (
               <span className="hidden items-center gap-1 md:flex">

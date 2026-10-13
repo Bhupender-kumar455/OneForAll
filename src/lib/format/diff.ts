@@ -11,6 +11,19 @@
 
 export type DiffKind = 'equal' | 'added' | 'removed' | 'changed';
 
+/**
+ * Comparison settings for {@link diffLines}. They only decide which lines are
+ * treated as the *same* line: rows always carry the original text, so a pair
+ * that matches under `ignoreWhitespace` still reads as it was written on each
+ * side.
+ */
+export interface DiffOptions {
+  /** Treat lines that differ only by letter case as equal. */
+  ignoreCase?: boolean;
+  /** Treat lines that differ only by whitespace as equal. */
+  ignoreWhitespace?: boolean;
+}
+
 export interface DiffRow {
   kind: DiffKind;
   /** 1-based line number in the input, or null when the row only exists on the right. */
@@ -43,6 +56,18 @@ type Op =
   | { type: 'delete'; left: number }
   | { type: 'insert'; right: number };
 
+/**
+ * The value a line is *compared* by. Collapsing and trimming whitespace is what
+ * makes `  a b` and `a  b` the same line; case folding is separate so either
+ * option can be used on its own.
+ */
+function compareKey(line: string, options: DiffOptions): string {
+  let key = line;
+  if (options.ignoreWhitespace) key = key.replace(/\s+/g, ' ').trim();
+  if (options.ignoreCase) key = key.toLowerCase();
+  return key;
+}
+
 /** Splits into lines, treating a single trailing newline as a terminator. */
 function toLines(value: string): string[] {
   if (!value) return [];
@@ -51,17 +76,21 @@ function toLines(value: string): string[] {
   return trimmed.split('\n');
 }
 
-/** Longest-common-subsequence edit script over two line arrays. */
-function lcsScript(left: string[], right: string[]): Op[] {
-  const n = left.length;
-  const m = right.length;
+/**
+ * Longest-common-subsequence edit script over two arrays of comparison keys.
+ * The caller passes keys rather than raw lines so the options never leak into
+ * the alignment logic.
+ */
+function lcsScript(leftKeys: string[], rightKeys: string[]): Op[] {
+  const n = leftKeys.length;
+  const m = rightKeys.length;
   const stride = m + 1;
   // table[i * stride + j] = LCS length of left[i..] and right[j..]
   const table = new Int32Array((n + 1) * stride);
   for (let i = n - 1; i >= 0; i -= 1) {
     for (let j = m - 1; j >= 0; j -= 1) {
       table[i * stride + j] =
-        left[i] === right[j]
+        leftKeys[i] === rightKeys[j]
           ? table[(i + 1) * stride + (j + 1)] + 1
           : Math.max(table[(i + 1) * stride + j], table[i * stride + (j + 1)]);
     }
@@ -71,7 +100,7 @@ function lcsScript(left: string[], right: string[]): Op[] {
   let i = 0;
   let j = 0;
   while (i < n && j < m) {
-    if (left[i] === right[j]) {
+    if (leftKeys[i] === rightKeys[j]) {
       script.push({ type: 'equal', left: i, right: j });
       i += 1;
       j += 1;
@@ -174,23 +203,30 @@ function rowsFromScript(
   return rows;
 }
 
-/** Diffs two documents line by line into side-by-side rows. */
-export function diffLines(before: string, after: string): DiffResult {
+/**
+ * Diffs two documents line by line into side-by-side rows. With no options the
+ * comparison is exact; the options only relax how lines are matched.
+ */
+export function diffLines(before: string, after: string, options: DiffOptions = {}): DiffResult {
   const left = toLines(before);
   const right = toLines(after);
+  const leftKeys = left.map((line) => compareKey(line, options));
+  const rightKeys = right.map((line) => compareKey(line, options));
 
   let start = 0;
-  while (start < left.length && start < right.length && left[start] === right[start]) start += 1;
+  while (start < left.length && start < right.length && leftKeys[start] === rightKeys[start]) start += 1;
 
   let endLeft = left.length;
   let endRight = right.length;
-  while (endLeft > start && endRight > start && left[endLeft - 1] === right[endRight - 1]) {
+  while (endLeft > start && endRight > start && leftKeys[endLeft - 1] === rightKeys[endRight - 1]) {
     endLeft -= 1;
     endRight -= 1;
   }
 
   const middleLeft = left.slice(start, endLeft);
   const middleRight = right.slice(start, endRight);
+  const middleLeftKeys = leftKeys.slice(start, endLeft);
+  const middleRightKeys = rightKeys.slice(start, endRight);
   const exact = middleLeft.length * middleRight.length <= MAX_LCS_CELLS;
 
   const rows: DiffRow[] = [];
@@ -200,7 +236,9 @@ export function diffLines(before: string, after: string): DiffResult {
 
   rows.push(
     ...rowsFromScript(
-      exact ? lcsScript(middleLeft, middleRight) : blockScript(middleLeft, middleRight),
+      exact
+        ? lcsScript(middleLeftKeys, middleRightKeys)
+        : blockScript(middleLeft, middleRight),
       middleLeft,
       middleRight,
       start,

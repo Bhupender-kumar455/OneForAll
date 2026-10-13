@@ -20,6 +20,12 @@ import {
   Upload,
   WandSparkles,
 } from "lucide-react";
+import {
+  DiffCounts,
+  DiffMessage,
+  DiffView,
+  diffSummary,
+} from "@/components/diff-view";
 import { Panel } from "@/components/panel";
 import { SiteHeader } from "@/components/site-header";
 import { countStats, formatBytes } from "@/lib/bytes";
@@ -662,88 +668,22 @@ export default function FormatterPage() {
             title="Diff"
             subtitle={
               diff && !diff.identical
-                ? `${diff.added + diff.changed} lines added · ${diff.removed + diff.changed} removed`
+                ? diffSummary(diff)
                 : `${info.label} · input against output`
             }
-            actions={
-              diff && !diff.identical ? (
-                <span className="mr-0.5 flex items-center gap-2 rounded-full border border-border px-2 py-0.5 font-mono text-[11px] font-medium">
-                  <span className="text-chart-5">
-                    +{diff.added + diff.changed}
-                  </span>
-                  <span className="text-destructive">
-                    −{diff.removed + diff.changed}
-                  </span>
-                </span>
-              ) : undefined
-            }
+            actions={diff && !diff.identical ? <DiffCounts result={diff} /> : undefined}
           >
             {!diff ? (
-              <div className="flex h-[110px] items-center justify-center p-6 text-center">
-                <div>
-                  <FileCode2 className="mx-auto h-5 w-5 text-muted-foreground/60" />
-                  <p className="mt-2 text-[13px] text-muted-foreground">
-                    A line-by-line comparison appears here
-                  </p>
-                </div>
-              </div>
+              <DiffMessage icon={FileCode2}>
+                A line-by-line comparison appears here
+              </DiffMessage>
             ) : diff.identical ? (
-              <div className="flex h-[110px] items-center justify-center p-6 text-center">
-                <div>
-                  <Check className="mx-auto h-5 w-5 text-muted-foreground/60" />
-                  <p className="mt-2 text-[13px] text-muted-foreground">
-                    No changes — the input is already{" "}
-                    {mode === "minify" ? "minified" : "formatted"}
-                  </p>
-                </div>
-              </div>
+              <DiffMessage icon={Check}>
+                No changes — the input is already{" "}
+                {mode === "minify" ? "minified" : "formatted"}
+              </DiffMessage>
             ) : (
-              <div
-                data-testid="diff-view"
-                className="editor-scroll max-h-[60vh] overflow-y-auto"
-              >
-                {diff.rows.map((row, index) => (
-                  <div
-                    key={index}
-                    data-testid="diff-row"
-                    className="diff-row flex border-b border-border/60 last:border-b-0"
-                  >
-                    <div
-                      className={cn(
-                        "diff-side flex w-1/2 border-r border-border/60",
-                        (row.kind === "removed" || row.kind === "changed") &&
-                          "diff-removed",
-                      )}
-                    >
-                      <span className="w-11 shrink-0 select-none px-2 text-right font-mono text-[11px] leading-6 text-muted-foreground/70">
-                        {row.leftNumber ?? ""}
-                      </span>
-                      <span className="shrink-0 whitespace-pre px-2 font-mono text-[12.5px] leading-6 text-foreground">
-                        {row.left ?? ""}
-                      </span>
-                    </div>
-                    <div
-                      className={cn(
-                        "diff-side flex w-1/2",
-                        (row.kind === "added" || row.kind === "changed") &&
-                          "diff-added",
-                      )}
-                    >
-                      <span className="w-11 shrink-0 select-none px-2 text-right font-mono text-[11px] leading-6 text-muted-foreground/70">
-                        {row.rightNumber ?? ""}
-                      </span>
-                      <span className="shrink-0 whitespace-pre px-2 font-mono text-[12.5px] leading-6 text-foreground">
-                        {row.right ?? ""}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-            {diff?.approximate && (
-              <p className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
-                Too large to align line by line — shown as one replaced block.
-              </p>
+              <DiffView result={diff} />
             )}
           </Panel>
         </div>

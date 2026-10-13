@@ -5,6 +5,7 @@ import { ErrorBoundary } from "@/components/error-boundary";
 import FormatterPage from "@/pages/formatter";
 import NotFound from "@/pages/not-found";
 import CodeRunnerPage from "@/pages/code-runner";
+import DiffCheckerPage from "@/pages/diff-checker";
 import TextExtractor from "@/pages/text-extractor";
 import TransferPage from "@/pages/transfer";
 
@@ -23,6 +24,7 @@ function Router() {
         <Route path="/extract" component={TextExtractor} />
         <Route path="/transfer" component={TransferPage} />
         <Route path="/run" component={CodeRunnerPage} />
+        <Route path="/diff" component={DiffCheckerPage} />
         <Route component={NotFound} />
       </Switch>
     </RoutedErrorBoundary>
